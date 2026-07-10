@@ -8,7 +8,7 @@
 // The manager runs in-process against the current kubeconfig, which must
 // point at a kind cluster (the test refuses anything else). Set up with:
 //
-//	make kind-up && make test-e2e     # or just: make e2e
+//	just kind-up && just test-e2e     # or simply: just e2e
 package e2e
 
 import (
@@ -62,7 +62,7 @@ func requireKind(t *testing.T) {
 		t.Fatalf("loading kubeconfig: %v", err)
 	}
 	if !strings.HasPrefix(cfg.CurrentContext, "kind-") {
-		t.Fatalf("current kubeconfig context %q is not a kind cluster; refusing to run e2e (use `make kind-up`)", cfg.CurrentContext)
+		t.Fatalf("current kubeconfig context %q is not a kind cluster; refusing to run e2e (use `just kind-up`)", cfg.CurrentContext)
 	}
 }
 

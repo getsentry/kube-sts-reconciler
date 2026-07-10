@@ -52,9 +52,9 @@ never recreates the StatefulSet itself — the next `kubectl apply`/deploy sync 
 ## Development & testing
 
 ```sh
-make test               # unit tests (no cluster needed)
-make test-integration   # envtest: real kube-apiserver
-make e2e                # kind: full loop against a real cluster
+just test               # unit tests (no cluster needed)
+just test-integration   # envtest: real kube-apiserver
+just e2e                # kind: full loop against a real cluster
 ```
 
 See [docs/testing.md](docs/testing.md) — including how the harness simulates the CSI

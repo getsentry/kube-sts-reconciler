@@ -16,10 +16,11 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
+      - uses: extractions/setup-just@v2
       - name: Check formatting
         run: test -z "$(gofmt -l cmd internal test)"
       - name: Vet (all build tags)
-        run: make vet
+        run: just vet
       - name: Unit tests
         run: go test -race ./internal/...
 
@@ -30,8 +31,9 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
+      - uses: extractions/setup-just@v2
       - name: Integration tests (envtest)
-        run: make test-integration
+        run: just test-integration
 
   e2e:
     runs-on: ubuntu-latest
@@ -40,6 +42,7 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
+      - uses: extractions/setup-just@v2
       - name: Create kind cluster
         uses: helm/kind-action@v1
         with:
@@ -47,4 +50,4 @@ jobs:
           node_image: kindest/node:v1.33.1
           config: hack/kind-config.yaml
       - name: E2E tests
-        run: make test-e2e
+        run: just test-e2e

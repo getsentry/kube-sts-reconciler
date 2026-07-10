@@ -7,9 +7,9 @@ annotations once a recreated StatefulSet shows no drift.
 
 | Layer | Command | Needs | What's real |
 |---|---|---|---|
-| Unit | `make test` | Go only | Contract parsing, drift/convergence logic, and the full state machine against a fake client (13 scenarios incl. dry-run, timeouts, failure latching) |
-| Integration | `make test-integration` | Network (first run downloads envtest binaries) | A real kube-apiserver + etcd: API validation, admission (`PersistentVolumeClaimResize`), merge-patch semantics, live watch-driven manager |
-| E2E | `make e2e` | Docker + [kind](https://kind.sigs.k8s.io/) + kubectl | Everything: real StatefulSet controller, scheduler, kubelet, pods with bound local-path PVCs |
+| Unit | `just test` | Go only | Contract parsing, drift/convergence logic, and the full state machine against a fake client (13 scenarios incl. dry-run, timeouts, failure latching) |
+| Integration | `just test-integration` | Network (first run downloads envtest binaries) | A real kube-apiserver + etcd: API validation, admission (`PersistentVolumeClaimResize`), merge-patch semantics, live watch-driven manager |
+| E2E | `just e2e` | Docker + [kind](https://kind.sigs.k8s.io/) + kubectl | Everything: real StatefulSet controller, scheduler, kubelet, pods with bound local-path PVCs |
 
 ## The CSI gap, and the simulator
 
@@ -27,7 +27,7 @@ experiment), while real-CSI behavior stays a milestone-2 concern on s4s2.
 ## Unit tests
 
 ```sh
-make test
+just test
 ```
 
 `internal/contract`, `internal/drift`, and `internal/controller` (fake client). Fast
@@ -40,7 +40,7 @@ stale status cleanup, and PVC→StatefulSet watch mapping.
 ## Integration tests (envtest)
 
 ```sh
-make test-integration
+just test-integration
 ```
 
 Starts a real kube-apiserver with `VolumeAttributesClass=true` and
@@ -50,16 +50,16 @@ them Bound themselves, and play the CSI driver inline. First run downloads the e
 binaries via `setup-envtest`; they're cached afterwards.
 
 The suite skips itself politely when `KUBEBUILDER_ASSETS` is unset — always invoke it
-through the Makefile target.
+through the justfile recipe.
 
 ## E2E (kind)
 
 ```sh
-make e2e            # kind-up + test-e2e
-make kind-down      # tear down
+just e2e            # kind-up + test-e2e
+just kind-down      # tear down
 ```
 
-`make kind-up` creates a cluster from `hack/kind-config.yaml`, which enables the
+`just kind-up` creates a cluster from `hack/kind-config.yaml`, which enables the
 `VolumeAttributesClass` feature gate and the `storage.k8s.io/v1beta1` API — without
 these, the API server silently drops `spec.volumeAttributesClassName` from PVCs, which
 is worth knowing about your real clusters too.

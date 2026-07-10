@@ -8,7 +8,7 @@
 // admission (e.g. the PersistentVolumeClaimResize admission plugin), merge
 // patch semantics, and the watch-driven reconcile loop of a live manager.
 //
-// Run with: make test-integration
+// Run with: just test-integration
 package integration
 
 import (
@@ -50,7 +50,7 @@ const stsName = "broker"
 
 func TestMain(m *testing.M) {
 	if os.Getenv("KUBEBUILDER_ASSETS") == "" {
-		fmt.Println("KUBEBUILDER_ASSETS not set; skipping integration suite (run via `make test-integration`)")
+		fmt.Println("KUBEBUILDER_ASSETS not set; skipping integration suite (run via `just test-integration`)")
 		os.Exit(0)
 	}
 	logf.SetLogger(zap.New(zap.UseDevMode(true)))
