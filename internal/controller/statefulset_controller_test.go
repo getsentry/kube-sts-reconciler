@@ -24,6 +24,7 @@ import (
 
 	"github.com/getsentry/kube-sts-reconciler/internal/contract"
 	"github.com/getsentry/kube-sts-reconciler/internal/drift"
+	"github.com/getsentry/kube-sts-reconciler/internal/recreate"
 )
 
 const (
@@ -665,6 +666,135 @@ func TestDeleteGateTimeoutLatchesFailed(t *testing.T) {
 	}
 	if f.stsGone() {
 		t.Fatal("StatefulSet must survive a blocked delete")
+	}
+}
+
+func TestSelfRecreateFullLoop(t *testing.T) {
+	desired := desiredJSON(t, map[string]map[string]string{
+		"sqlite": {"volumeAttributesClassName": "vac-new", "storage": "200Gi"},
+	})
+	f := newFixture(t,
+		healthySTS(map[string]string{contract.DesiredSpecAnnotation: desired}),
+		boundPVC("sqlite-broker-0", "fast", "100Gi", "100Gi"),
+		boundPVC("sqlite-broker-1", "fast", "100Gi", "100Gi"),
+		expandableSC("fast"),
+		vac("vac-new"),
+	)
+	f.r.SelfRecreate = true
+
+	f.reconcile() // patch PVCs
+	f.reconcile() // AwaitingConvergence
+	f.simulateCSI("sqlite-broker-0")
+	f.simulateCSI("sqlite-broker-1")
+	f.reconcile() // snapshot + orphan-delete
+	if !f.stsGone() {
+		t.Fatal("StatefulSet should be deleted")
+	}
+	cm := &corev1.ConfigMap{}
+	if err := f.client.Get(context.Background(), types.NamespacedName{Namespace: testNS, Name: recreate.SnapshotName(testSTS)}, cm); err != nil {
+		t.Fatalf("snapshot ConfigMap should exist while STS is gone: %v", err)
+	}
+
+	f.reconcile() // NotFound path: recreate from snapshot
+	sts := f.getSTS()
+	tmpl := sts.Spec.VolumeClaimTemplates[0].Spec
+	if tmpl.VolumeAttributesClassName == nil || *tmpl.VolumeAttributesClassName != "vac-new" {
+		t.Fatalf("recreated template VAC = %v", tmpl.VolumeAttributesClassName)
+	}
+	if got := tmpl.Resources.Requests[corev1.ResourceStorage]; got.String() != "200Gi" {
+		t.Fatalf("recreated template storage = %s", got.String())
+	}
+	if _, has := sts.Annotations[contract.DesiredSpecAnnotation]; has {
+		t.Fatal("recreated StatefulSet must not carry reconciler annotations")
+	}
+	if err := f.client.Get(context.Background(), types.NamespacedName{Namespace: testNS, Name: recreate.SnapshotName(testSTS)}, &corev1.ConfigMap{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("snapshot ConfigMap should be deleted after recreation, got %v", err)
+	}
+	f.expectEvent(ReasonRecreated)
+
+	// PVCs kept their patched specs throughout.
+	if got := f.getPVC("sqlite-broker-0").Spec.Resources.Requests[corev1.ResourceStorage]; got.String() != "200Gi" {
+		t.Fatal("PVC lost its patch across the recreate")
+	}
+}
+
+func TestSelfRecreateRecoversFromOrphanedSnapshot(t *testing.T) {
+	// Simulates a controller crash between orphan-delete and recreation: no
+	// StatefulSet, only the snapshot ConfigMap. The reconcile (triggered by
+	// the ConfigMap watch on cache sync) must recreate the StatefulSet.
+	desired := desiredJSON(t, map[string]map[string]string{"sqlite": {"storage": "200Gi"}})
+	spec, err := contract.ParseDesiredSpec(desired)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := recreate.NewSnapshot(healthySTS(nil), spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f := newFixture(t, snapshot)
+	f.r.SelfRecreate = true
+
+	// The ConfigMap watch maps the snapshot back to the StatefulSet name.
+	reqs := mapSnapshotToStatefulSet(context.Background(), snapshot)
+	if len(reqs) != 1 || reqs[0].Name != testSTS {
+		t.Fatalf("mapper reqs = %v", reqs)
+	}
+
+	f.reconcile()
+	sts := f.getSTS()
+	if got := sts.Spec.VolumeClaimTemplates[0].Spec.Resources.Requests[corev1.ResourceStorage]; got.String() != "200Gi" {
+		t.Fatalf("recovered template storage = %s", got.String())
+	}
+}
+
+func TestDeployModeDoesNotRecreate(t *testing.T) {
+	// A snapshot ConfigMap exists (e.g. left over from a self-mode run), but
+	// the controller runs in deploy mode: a deleted StatefulSet must stay
+	// deleted.
+	desired := desiredJSON(t, map[string]map[string]string{"sqlite": {"storage": "200Gi"}})
+	spec, err := contract.ParseDesiredSpec(desired)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := recreate.NewSnapshot(healthySTS(nil), spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f := newFixture(t, snapshot)
+
+	f.reconcile()
+	if !f.stsGone() {
+		t.Fatal("deploy mode must never create StatefulSets")
+	}
+}
+
+func TestFailedLatchSurvivesStatusWriteFailure(t *testing.T) {
+	// A shrink is terminal. Even if the Failed status annotation could not be
+	// written (simulated by clearing it), a second reconcile must not
+	// re-emit the warning event thanks to the in-memory latch.
+	desired := desiredJSON(t, map[string]map[string]string{"sqlite": {"storage": "50Gi"}})
+	f := newFixture(t,
+		healthySTS(map[string]string{contract.DesiredSpecAnnotation: desired}),
+		boundPVC("sqlite-broker-0", "fast", "100Gi", "100Gi"),
+		expandableSC("fast"),
+	)
+	f.reconcile()
+	f.drainEvents()
+
+	// Simulate the status write having been lost.
+	sts := f.getSTS()
+	delete(sts.Annotations, contract.StatusAnnotation)
+	if err := f.client.Update(context.Background(), sts); err != nil {
+		t.Fatal(err)
+	}
+
+	f.reconcile()
+	if events := f.drainEvents(); len(events) != 0 {
+		t.Fatalf("in-memory latch should suppress re-alerts, got %v", events)
+	}
+	// And the retried write restored the persisted latch.
+	if st := f.status(); st == nil || st.State != contract.StateFailed {
+		t.Fatalf("status = %+v, want Failed restored from memory latch", st)
 	}
 }
 

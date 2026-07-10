@@ -49,7 +49,7 @@ func main() {
 	flag.BoolVar(&dryRun, "dry-run", false, "Log and emit events for intended actions without mutating anything.")
 	flag.DurationVar(&convergenceTimeout, "convergence-timeout", 10*time.Minute, "How long PVC status may lag the patched spec before the reconcile is marked Failed.")
 	flag.DurationVar(&gateTimeout, "gate-timeout", 10*time.Minute, "How long the health gate may block a reconcile before it is marked Failed.")
-	flag.StringVar(&recreateMode, "recreate-mode", "deploy", "Who recreates the StatefulSet after orphan-delete: 'deploy' (external re-apply; only supported mode today) or 'self' (not yet implemented).")
+	flag.StringVar(&recreateMode, "recreate-mode", "deploy", "Who recreates the StatefulSet after orphan-delete: 'deploy' (external re-apply, e.g. the next deploy sync) or 'self' (the controller snapshots the manifest and recreates it itself).")
 	opts := zap.Options{Development: false}
 	opts.BindFlags(flag.CommandLine)
 	flag.Parse()
@@ -57,8 +57,8 @@ func main() {
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
 	setupLog := ctrl.Log.WithName("setup")
 
-	if recreateMode != "deploy" {
-		setupLog.Error(nil, "unsupported --recreate-mode; only 'deploy' is implemented", "recreateMode", recreateMode)
+	if recreateMode != "deploy" && recreateMode != "self" {
+		setupLog.Error(nil, "unsupported --recreate-mode; use 'deploy' or 'self'", "recreateMode", recreateMode)
 		os.Exit(1)
 	}
 
@@ -80,6 +80,7 @@ func main() {
 		DryRun:             dryRun,
 		ConvergenceTimeout: convergenceTimeout,
 		GateTimeout:        gateTimeout,
+		SelfRecreate:       recreateMode == "self",
 	}
 	if err := r.SetupWithManager(mgr, labelSelector); err != nil {
 		setupLog.Error(err, "unable to set up reconciler")
@@ -95,7 +96,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	setupLog.Info("starting manager", "dryRun", dryRun, "labelSelector", labelSelector, "convergenceTimeout", convergenceTimeout)
+	setupLog.Info("starting manager", "dryRun", dryRun, "labelSelector", labelSelector, "convergenceTimeout", convergenceTimeout, "recreateMode", recreateMode)
 	if err := mgr.Start(ctrl.SetupSignalHandler()); err != nil {
 		setupLog.Error(err, "manager exited with error")
 		os.Exit(1)

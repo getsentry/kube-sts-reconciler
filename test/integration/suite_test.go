@@ -99,6 +99,17 @@ func TestMain(m *testing.M) {
 		fmt.Printf("failed to set up reconciler: %v\n", err)
 		os.Exit(1)
 	}
+	// A second instance in self-recreate mode, scoped to a different label so
+	// the two modes never reconcile the same StatefulSet.
+	rSelf := &controller.Reconciler{
+		Client:       mgr.GetClient(),
+		Recorder:     mgr.GetEventRecorderFor("sts-volume-reconciler-self"),
+		SelfRecreate: true,
+	}
+	if err := rSelf.SetupWithManager(mgr, "service=taskbroker-self"); err != nil {
+		fmt.Printf("failed to set up self-recreate reconciler: %v\n", err)
+		os.Exit(1)
+	}
 	go func() {
 		if err := mgr.Start(ctx); err != nil {
 			fmt.Printf("manager exited: %v\n", err)
@@ -466,6 +477,72 @@ func TestExpansionRejectedByAdmissionSurfacesAsError(t *testing.T) {
 	})
 	if got := getPVC(t, ns, "data-broker-0").Spec.Resources.Requests[corev1.ResourceStorage]; got.String() != "1Gi" {
 		t.Fatal("PVC must not be patched when the StorageClass forbids expansion")
+	}
+}
+
+func TestSelfRecreateLoop(t *testing.T) {
+	ns := newNamespace(t)
+	createSC(t, "expandable", true)
+	createVAC(t, "vac-fast")
+
+	sts := newSTS(ns, "expandable", 1)
+	sts.Labels["service"] = "taskbroker-self" // routed to the self-recreate reconciler
+	if err := k8sClient.Create(ctxT(t), sts); err != nil {
+		t.Fatal(err)
+	}
+	createBoundPVCs(t, ns, "expandable", 1)
+	markReady(t, sts)
+
+	annotate(t, ns, map[string]map[string]string{
+		"data": {"volumeAttributesClassName": "vac-fast", "storage": "2Gi"},
+	})
+
+	eventually(t, "PVC spec patched", func() (bool, error) {
+		pvc := getPVC(t, ns, "data-broker-0")
+		vacOK := pvc.Spec.VolumeAttributesClassName != nil && *pvc.Spec.VolumeAttributesClassName == "vac-fast"
+		req := pvc.Spec.Resources.Requests[corev1.ResourceStorage]
+		return vacOK && req.String() == "2Gi", nil
+	})
+
+	// Converge, play the GC on the terminating old object, and wait for the
+	// controller to recreate the StatefulSet from its snapshot — no external
+	// re-apply happens in this test.
+	eventually(t, "StatefulSet recreated by the controller", func() (bool, error) {
+		simulateCSI(t, ns, "data-broker-0")
+		got := &appsv1.StatefulSet{}
+		err := k8sClient.Get(ctxT(t), types.NamespacedName{Namespace: ns, Name: stsName}, got)
+		if apierrors.IsNotFound(err) {
+			return false, nil // deleted, recreation pending
+		}
+		if err != nil {
+			return false, err
+		}
+		if got.DeletionTimestamp != nil {
+			finalizeOrphanDelete(t, ns) // play the absent GC
+			return false, nil
+		}
+		tmpl := got.Spec.VolumeClaimTemplates[0].Spec
+		req := tmpl.Resources.Requests[corev1.ResourceStorage]
+		recreated := tmpl.VolumeAttributesClassName != nil && *tmpl.VolumeAttributesClassName == "vac-fast" &&
+			req.String() == "2Gi"
+		return recreated, nil
+	})
+
+	// The recreated StatefulSet carries no reconciler annotations and the
+	// snapshot ConfigMap is cleaned up.
+	got := &appsv1.StatefulSet{}
+	if err := k8sClient.Get(ctxT(t), types.NamespacedName{Namespace: ns, Name: stsName}, got); err != nil {
+		t.Fatal(err)
+	}
+	if _, has := got.Annotations[contract.DesiredSpecAnnotation]; has {
+		t.Fatal("recreated StatefulSet must not carry the desired-spec annotation")
+	}
+	eventually(t, "snapshot ConfigMap removed", func() (bool, error) {
+		err := k8sClient.Get(ctxT(t), types.NamespacedName{Namespace: ns, Name: "sts-snapshot-" + stsName}, &corev1.ConfigMap{})
+		return apierrors.IsNotFound(err), nil
+	})
+	if got := getPVC(t, ns, "data-broker-0").Spec.Resources.Requests[corev1.ResourceStorage]; got.String() != "2Gi" {
+		t.Fatal("PVC lost its patch across the self-recreate")
 	}
 }
 

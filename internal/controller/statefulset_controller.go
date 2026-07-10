@@ -39,6 +39,7 @@ import (
 
 	"github.com/getsentry/kube-sts-reconciler/internal/contract"
 	"github.com/getsentry/kube-sts-reconciler/internal/drift"
+	"github.com/getsentry/kube-sts-reconciler/internal/recreate"
 )
 
 // Event reasons emitted on the StatefulSet.
@@ -53,6 +54,7 @@ const (
 	ReasonHealthGateTimeout    = "HealthGateTimeout"
 	ReasonModifyInfeasible     = "ModifyVolumeInfeasible"
 	ReasonOrphanDeleted        = "OrphanDeleted"
+	ReasonRecreated            = "Recreated"
 	ReasonReconcileComplete    = "ReconcileComplete"
 	ReasonDryRun               = "DryRun"
 )
@@ -88,12 +90,26 @@ type Reconciler struct {
 	// minutes.
 	GateTimeout time.Duration
 
+	// SelfRecreate enables --recreate-mode=self: the controller snapshots the
+	// StatefulSet manifest to a ConfigMap before the orphan-delete and
+	// recreates it (with merged volumeClaimTemplates) itself, instead of
+	// waiting for the next deploy to re-apply it.
+	SelfRecreate bool
+
 	// waitAnchors is an in-memory fallback for the timeout anchors normally
 	// persisted in the status annotation, so a timeout still fires even when
-	// annotation writes keep failing. Losing it on restart only extends a
-	// timeout, never shortens one.
-	mu          sync.Mutex
-	waitAnchors map[string]waitAnchor
+	// annotation writes keep failing. failedLatches is the same fallback for
+	// the Failed latch, so a terminal failure alerts once even when the
+	// status write fails. Losing either on restart only extends a timeout or
+	// re-emits one event, never loses safety.
+	mu            sync.Mutex
+	waitAnchors   map[string]waitAnchor
+	failedLatches map[string]failedLatch
+}
+
+type failedLatch struct {
+	specHash string
+	status   *contract.Status
 }
 
 type waitAnchor struct {
@@ -126,6 +142,32 @@ func (r *Reconciler) clearAnchor(namespace, name string) {
 	delete(r.waitAnchors, namespace+"/"+name)
 }
 
+// latchFailed records a terminal failure in memory before the status write is
+// even attempted, so the warning event cannot be re-emitted on write retries.
+func (r *Reconciler) latchFailed(sts *appsv1.StatefulSet, st *contract.Status) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.failedLatches == nil {
+		r.failedLatches = map[string]failedLatch{}
+	}
+	r.failedLatches[sts.Namespace+"/"+sts.Name] = failedLatch{specHash: st.ObservedSpecHash, status: st}
+}
+
+func (r *Reconciler) failedLatchFor(sts *appsv1.StatefulSet, specHash string) *contract.Status {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if l, ok := r.failedLatches[sts.Namespace+"/"+sts.Name]; ok && l.specHash == specHash {
+		return l.status
+	}
+	return nil
+}
+
+func (r *Reconciler) clearFailedLatch(namespace, name string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	delete(r.failedLatches, namespace+"/"+name)
+}
+
 func (r *Reconciler) convergenceTimeout() time.Duration {
 	if r.ConvergenceTimeout <= 0 {
 		return 10 * time.Minute
@@ -145,6 +187,10 @@ func (r *Reconciler) gateTimeout() time.Duration {
 // +kubebuilder:rbac:groups=storage.k8s.io,resources=volumeattributesclasses,verbs=get;list;watch
 // +kubebuilder:rbac:groups=storage.k8s.io,resources=storageclasses,verbs=get
 // +kubebuilder:rbac:groups=core,resources=events,verbs=create;patch
+//
+// Self-recreate mode only — omit from the role when running --recreate-mode=deploy:
+// +kubebuilder:rbac:groups=apps,resources=statefulsets,verbs=create
+// +kubebuilder:rbac:groups=core,resources=configmaps,verbs=get;list;watch;create;update;delete
 
 // Reconcile implements the level-triggered state machine.
 func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -152,13 +198,19 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 
 	sts := &appsv1.StatefulSet{}
 	if err := r.Get(ctx, req.NamespacedName, sts); err != nil {
-		// A deleted StatefulSet needs nothing from us: PVCs are already
-		// converged by the time we delete, and the terminal cleanup happens
-		// when the recreated StatefulSet shows empty drift.
 		if apierrors.IsNotFound(err) {
 			r.clearAnchor(req.Namespace, req.Name)
+			r.clearFailedLatch(req.Namespace, req.Name)
+			if r.SelfRecreate {
+				// In self mode the delete's watch event lands here: recreate
+				// from the snapshot taken before the orphan-delete. In deploy
+				// mode a deleted StatefulSet needs nothing from us — the next
+				// deploy re-applies it.
+				return r.recreateFromSnapshot(ctx, req.NamespacedName)
+			}
+			return ctrl.Result{}, nil
 		}
-		return ctrl.Result{}, client.IgnoreNotFound(err)
+		return ctrl.Result{}, err
 	}
 	if sts.DeletionTimestamp != nil {
 		return ctrl.Result{}, nil
@@ -175,6 +227,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	if !ok {
 		// No desired spec. Clear any stale status annotation left behind
 		// (e.g. an operator removed the desired spec to abort).
+		r.clearFailedLatch(sts.Namespace, sts.Name)
 		if _, has := sts.Annotations[contract.StatusAnnotation]; has {
 			return ctrl.Result{}, r.removeAnnotations(ctx, sts, contract.StatusAnnotation)
 		}
@@ -188,6 +241,12 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		// repeated warning events) until the operator changes or removes the
 		// desired spec.
 		return ctrl.Result{}, nil
+	}
+	if latched := r.failedLatchFor(sts, specHash); latched != nil {
+		// The failure already alerted but its status write failed; keep
+		// retrying the write quietly instead of re-evaluating (and
+		// re-alerting) the whole reconcile.
+		return ctrl.Result{}, r.writeStatus(ctx, sts, latched)
 	}
 
 	desired, err := contract.ParseDesiredSpec(raw)
@@ -228,7 +287,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		// PVCs converged; only the StatefulSet's own volumeClaimTemplates
 		// still disagree. Orphan-delete so it can be recreated with matching
 		// templates.
-		return r.deletePhase(ctx, sts, a, status, specHash)
+		return r.deletePhase(ctx, sts, desired, a, status, specHash)
 	}
 }
 
@@ -354,8 +413,11 @@ func (r *Reconciler) convergencePhase(ctx context.Context, sts *appsv1.StatefulS
 }
 
 // deletePhase orphan-deletes the StatefulSet. This is the only destructive
-// step and it runs last, once every PVC is verified converged.
-func (r *Reconciler) deletePhase(ctx context.Context, sts *appsv1.StatefulSet, a *drift.Assessment, status *contract.Status, specHash string) (ctrl.Result, error) {
+// step and it runs last, once every PVC is verified converged. In self mode
+// the manifest is snapshotted to a ConfigMap first, so the delete's watch
+// event (or a restarted controller finding the snapshot) can recreate the
+// StatefulSet without waiting for a deploy.
+func (r *Reconciler) deletePhase(ctx context.Context, sts *appsv1.StatefulSet, desired *contract.DesiredSpec, a *drift.Assessment, status *contract.Status, specHash string) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
 
 	if reason := healthGate(sts); reason != "" {
@@ -364,9 +426,18 @@ func (r *Reconciler) deletePhase(ctx context.Context, sts *appsv1.StatefulSet, a
 
 	if r.DryRun {
 		msg := fmt.Sprintf("dry-run: would orphan-delete StatefulSet %s/%s (PVCs converged, volumeClaimTemplates still drifted)", sts.Namespace, sts.Name)
+		if r.SelfRecreate {
+			msg = fmt.Sprintf("dry-run: would snapshot the manifest, orphan-delete StatefulSet %s/%s, and recreate it with updated volumeClaimTemplates", sts.Namespace, sts.Name)
+		}
 		log.Info(msg)
 		r.Recorder.Event(sts, corev1.EventTypeNormal, ReasonDryRun, msg)
 		return ctrl.Result{}, nil
+	}
+
+	if r.SelfRecreate {
+		if err := r.writeSnapshot(ctx, sts, desired); err != nil {
+			return ctrl.Result{}, fmt.Errorf("writing recreation snapshot: %w", err)
+		}
 	}
 
 	// Record the Deleting state first: if the delete fails or conflicts, the
@@ -408,6 +479,81 @@ func (r *Reconciler) deletePhase(ctx context.Context, sts *appsv1.StatefulSet, a
 	return ctrl.Result{}, nil
 }
 
+// writeSnapshot persists the recreation manifest before the orphan-delete.
+// Idempotent: an existing snapshot is overwritten, so a retried deletePhase
+// always captures the manifest as of the latest reconcile.
+func (r *Reconciler) writeSnapshot(ctx context.Context, sts *appsv1.StatefulSet, desired *contract.DesiredSpec) error {
+	cm, err := recreate.NewSnapshot(sts, desired)
+	if err != nil {
+		return err
+	}
+	if err := r.Create(ctx, cm); err != nil {
+		if !apierrors.IsAlreadyExists(err) {
+			return err
+		}
+		existing := &corev1.ConfigMap{}
+		if err := r.Get(ctx, types.NamespacedName{Namespace: cm.Namespace, Name: cm.Name}, existing); err != nil {
+			return err
+		}
+		existing.Labels = cm.Labels
+		existing.Annotations = cm.Annotations
+		existing.Data = cm.Data
+		if err := r.Update(ctx, existing); err != nil {
+			return err
+		}
+	}
+	logf.FromContext(ctx).Info("wrote recreation snapshot", "configmap", cm.Name)
+	return nil
+}
+
+// recreateFromSnapshot recreates a deleted StatefulSet from its snapshot
+// ConfigMap, then removes the snapshot. Reached via the StatefulSet delete
+// watch event, or via the ConfigMap watch after a controller restart.
+func (r *Reconciler) recreateFromSnapshot(ctx context.Context, key types.NamespacedName) (ctrl.Result, error) {
+	log := logf.FromContext(ctx)
+
+	cm := &corev1.ConfigMap{}
+	err := r.Get(ctx, types.NamespacedName{Namespace: key.Namespace, Name: recreate.SnapshotName(key.Name)}, cm)
+	if apierrors.IsNotFound(err) {
+		return ctrl.Result{}, nil // nothing pending for this StatefulSet
+	}
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+
+	sts, err := recreate.FromSnapshot(cm)
+	if err != nil {
+		// A corrupt snapshot cannot be acted on and retrying will not help;
+		// leave the ConfigMap in place for a human to inspect.
+		log.Error(err, "snapshot is unreadable; leaving it for manual inspection", "configmap", cm.Name)
+		return ctrl.Result{}, nil
+	}
+
+	if err := r.Create(ctx, sts); err != nil {
+		if apierrors.IsAlreadyExists(err) {
+			existing := &appsv1.StatefulSet{}
+			if getErr := r.Get(ctx, key, existing); getErr == nil && existing.DeletionTimestamp == nil {
+				// Someone else recreated it (e.g. a deploy raced us). The
+				// normal reconcile path owns it now; drop the stale snapshot.
+				log.Info("StatefulSet already recreated externally; dropping snapshot", "configmap", cm.Name)
+				return ctrl.Result{}, client.IgnoreNotFound(r.Delete(ctx, cm))
+			}
+			// The old object is still terminating (orphan finalizer); the
+			// next delete watch event retries, with a requeue as backstop.
+			return ctrl.Result{RequeueAfter: patchRequeue}, nil
+		}
+		return ctrl.Result{}, err
+	}
+
+	msg := fmt.Sprintf("recreated StatefulSet %s/%s from snapshot with updated volumeClaimTemplates", sts.Namespace, sts.Name)
+	log.Info(msg)
+	r.Recorder.Event(sts, corev1.EventTypeNormal, ReasonRecreated, msg)
+	if err := r.Delete(ctx, cm); err != nil && !apierrors.IsNotFound(err) {
+		return ctrl.Result{}, err
+	}
+	return ctrl.Result{}, nil
+}
+
 // complete clears both reconciler annotations: the terminal transition.
 func (r *Reconciler) complete(ctx context.Context, sts *appsv1.StatefulSet) (ctrl.Result, error) {
 	if r.DryRun {
@@ -420,6 +566,7 @@ func (r *Reconciler) complete(ctx context.Context, sts *appsv1.StatefulSet) (ctr
 		return ctrl.Result{}, err
 	}
 	r.clearAnchor(sts.Namespace, sts.Name)
+	r.clearFailedLatch(sts.Namespace, sts.Name)
 	r.Recorder.Event(sts, corev1.EventTypeNormal, ReasonReconcileComplete, "PVCs match desired spec; reconciliation complete")
 	logf.FromContext(ctx).Info("reconciliation complete", "statefulset", sts.Name)
 	return ctrl.Result{}, nil
@@ -434,15 +581,18 @@ func (r *Reconciler) fail(ctx context.Context, sts *appsv1.StatefulSet, specHash
 		return ctrl.Result{}, nil
 	}
 	r.clearAnchor(sts.Namespace, sts.Name)
-	err := r.writeStatus(ctx, sts, &contract.Status{
+	st := &contract.Status{
 		Version:          contract.SupportedVersion,
 		State:            contract.StateFailed,
 		ObservedSpecHash: specHash,
 		PVCs:             pvcStates,
 		Reason:           fmt.Sprintf("%s: %s", reason, message),
 		LastTransition:   time.Now().UTC(),
-	})
-	return ctrl.Result{}, err
+	}
+	// Latch in memory before the write: if the write fails and is retried,
+	// the retry persists this status quietly instead of re-alerting.
+	r.latchFailed(sts, st)
+	return ctrl.Result{}, r.writeStatus(ctx, sts, st)
 }
 
 // healthGate returns a non-empty reason when the StatefulSet is in no state
@@ -659,11 +809,35 @@ func (r *Reconciler) SetupWithManager(mgr ctrl.Manager, labelSelector string) er
 		r.Selector = compiled
 	}
 
-	return ctrl.NewControllerManagedBy(mgr).
-		Named("sts-volume-reconciler").
+	name := "sts-volume-reconciler"
+	if r.SelfRecreate {
+		name += "-self"
+	}
+	b := ctrl.NewControllerManagedBy(mgr).
+		Named(name).
 		For(&appsv1.StatefulSet{}, builder.WithPredicates(stsPredicates...)).
-		Watches(&corev1.PersistentVolumeClaim{}, handler.EnqueueRequestsFromMapFunc(r.mapPVCToStatefulSet)).
-		Complete(r)
+		Watches(&corev1.PersistentVolumeClaim{}, handler.EnqueueRequestsFromMapFunc(r.mapPVCToStatefulSet))
+	if r.SelfRecreate {
+		// Snapshot ConfigMaps re-enqueue their StatefulSet, so a controller
+		// restarted between orphan-delete and recreation resumes on cache
+		// sync instead of leaving the StatefulSet gone until a deploy.
+		b = b.Watches(&corev1.ConfigMap{}, handler.EnqueueRequestsFromMapFunc(mapSnapshotToStatefulSet))
+	}
+	return b.Complete(r)
+}
+
+// mapSnapshotToStatefulSet maps a snapshot ConfigMap event to the StatefulSet
+// it belongs to.
+func mapSnapshotToStatefulSet(_ context.Context, obj client.Object) []reconcile.Request {
+	cm, ok := obj.(*corev1.ConfigMap)
+	if !ok || cm.Labels[recreate.SnapshotLabel] != "true" {
+		return nil
+	}
+	name := cm.Labels[recreate.StatefulSetLabel]
+	if name == "" {
+		return nil
+	}
+	return []reconcile.Request{{NamespacedName: types.NamespacedName{Namespace: cm.Namespace, Name: name}}}
 }
 
 // mapPVCToStatefulSet maps a PVC event to the annotated StatefulSet that owns

@@ -46,8 +46,15 @@ go run ./cmd \
   --convergence-timeout=10m
 ```
 
-`--recreate-mode=deploy` (the default and only implemented mode) means the controller
-never recreates the StatefulSet itself — the next `kubectl apply`/deploy sync does.
+`--recreate-mode` picks who recreates the StatefulSet after the orphan-delete:
+
+- `deploy` (default): the controller waits; the next `kubectl apply`/deploy sync
+  recreates it. Fully stateless.
+- `self`: the controller snapshots the manifest to a ConfigMap before deleting,
+  recreates the StatefulSet itself with the updated `volumeClaimTemplates` (reconciler
+  annotations stripped), then removes the snapshot. The ConfigMap makes this
+  crash-safe: a controller restarted mid-flow resumes from it. Requires extra RBAC
+  (`create` on statefulsets, read/write on configmaps).
 
 ## Development & testing
 

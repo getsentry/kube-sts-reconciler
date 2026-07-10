@@ -119,6 +119,11 @@ just sandbox-annotate                        # re-stamp, as a deploy manifest wo
 just sandbox-status
 ```
 
+To try self-recreate mode instead, run the controller with
+`go run ./cmd --recreate-mode=self` — then skip the `sandbox-recreate` step entirely:
+the controller snapshots the manifest to a `sts-snapshot-broker` ConfigMap, deletes,
+recreates with updated templates, and removes the snapshot on its own.
+
 Useful one-offs while poking:
 
 ```sh

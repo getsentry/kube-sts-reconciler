@@ -184,8 +184,10 @@ Controlled by `--recreate-mode`, default `deploy`:
 | `self` | Before deleting, write the live STS manifest (minus server-managed fields, minus the reconciler annotations, with `volumeClaimTemplates` updated to match the desired spec) to a ConfigMap in the STS namespace. After delete, immediately re-apply it, then delete the ConfigMap. | Seconds-long STS-less window, no deploy dependency; controller briefly owns manifest state, and the merged template must be correct. |
 
 The state machine is identical up to `Deleting`; the modes only differ in what follows.
-`self` mode ships in milestone 3 (after `deploy` mode is proven), but the state machine and
-flag are designed in from the start so no rework is needed.
+Both modes are implemented. In `self` mode the snapshot ConfigMap doubles as the
+crash-recovery signal: a ConfigMap watch re-enqueues the StatefulSet on controller
+restart, so a crash between delete and recreate resumes instead of stranding the
+workload.
 
 Recreate race (`deploy` mode): if sentry-kube re-applies while the controller is still in
 `Patching`, the apply necessarily carries the *old* `volumeClaimTemplates` (the new ones are
