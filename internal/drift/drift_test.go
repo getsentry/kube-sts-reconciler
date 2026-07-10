@@ -184,6 +184,30 @@ func TestAssessModifyVolumeInProgressAndInfeasible(t *testing.T) {
 	}
 }
 
+func TestAssessStaleModifyVolumeStatusIsNotTerminal(t *testing.T) {
+	// The PVC carries an Infeasible ModifyVolumeStatus left over from a
+	// PREVIOUS target VAC. The current desired VAC is different and the CSI
+	// resizer just hasn't processed it yet: this must be a wait, not a
+	// latched failure.
+	desired := mustSpec(t, `{"version":1,"claims":{"sqlite":{"volumeAttributesClassName":"vac-new"}}}`)
+	s := sts(template("sqlite", "100Gi", nil))
+	p := pvc("sqlite-broker-0", "100Gi", "100Gi", strp("vac-new"), strp("vac-original"))
+	p.Status.ModifyVolumeStatus = &corev1.ModifyVolumeStatus{
+		TargetVolumeAttributesClassName: "vac-old-attempt",
+		Status:                          corev1.PersistentVolumeClaimModifyVolumeInfeasible,
+	}
+	a := Assess(desired, s, []ClaimPVC{{Claim: "sqlite", PVC: p}})
+	if a.Failed() {
+		t.Fatalf("stale infeasible status for another VAC must not fail the assessment: %v", a.Infeasible)
+	}
+	if a.Converged() {
+		t.Fatal("should be waiting for the resizer to process the new VAC")
+	}
+	if a.PVCStates["sqlite-broker-0"] != "AwaitingConvergence" {
+		t.Errorf("state = %q", a.PVCStates["sqlite-broker-0"])
+	}
+}
+
 func TestAssessFileSystemResizePendingIsConvergedEnough(t *testing.T) {
 	desired := mustSpec(t, `{"version":1,"claims":{"sqlite":{"storage":"200Gi"}}}`)
 	s := sts(template("sqlite", "200Gi", nil)) // template already updated

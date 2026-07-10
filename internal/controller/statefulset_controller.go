@@ -600,30 +600,20 @@ func (r *Reconciler) recreateFromSnapshot(ctx context.Context, key types.Namespa
 // one anchored PVC is required, and every existing claim PVC must agree.
 func (r *Reconciler) snapshotAnchored(ctx context.Context, cm *corev1.ConfigMap, sts *appsv1.StatefulSet) (bool, string, error) {
 	want := recreate.SnapshotHash(cm)
-	replicas := int32(1)
-	if sts.Spec.Replicas != nil {
-		replicas = *sts.Spec.Replicas
+	// Match the exact PVC set writeSnapshot anchored: every existing claim
+	// PVC at ANY ordinal, not just 0..replicas-1 — anchors on PVCs retained
+	// from a scale-down count too.
+	pvcs, err := r.listPVCsByClaims(ctx, sts.Namespace, sts.Name, templateClaimNames(sts))
+	if err != nil {
+		return false, "", err
 	}
-	anchored := 0
-	for _, tmpl := range sts.Spec.VolumeClaimTemplates {
-		for ordinal := int32(0); ordinal < replicas; ordinal++ {
-			pvc := &corev1.PersistentVolumeClaim{}
-			name := drift.PVCName(tmpl.Name, sts.Name, ordinal)
-			err := r.Get(ctx, types.NamespacedName{Namespace: sts.Namespace, Name: name}, pvc)
-			if apierrors.IsNotFound(err) {
-				continue
-			}
-			if err != nil {
-				return false, "", err
-			}
-			if got := pvc.Annotations[recreate.AnchorAnnotation]; got != want {
-				return false, fmt.Sprintf("PVC %s does not anchor this snapshot (anchor %q, want %q)", name, got, want), nil
-			}
-			anchored++
-		}
-	}
-	if anchored == 0 {
+	if len(pvcs) == 0 {
 		return false, "no PVC anchors this snapshot; refusing to create a StatefulSet from unverified ConfigMap content", nil
+	}
+	for _, cp := range pvcs {
+		if got := cp.PVC.Annotations[recreate.AnchorAnnotation]; got != want {
+			return false, fmt.Sprintf("PVC %s does not anchor this snapshot (anchor %q, want %q)", cp.PVC.Name, got, want), nil
+		}
 	}
 	return true, "", nil
 }
@@ -639,25 +629,20 @@ func (r *Reconciler) rejectSnapshot(ctx context.Context, cm *corev1.ConfigMap, r
 // succeeded. Best effort: a leftover anchor is harmless (it never matches a
 // future snapshot's hash).
 func (r *Reconciler) clearAnchorsFromPVCs(ctx context.Context, sts *appsv1.StatefulSet) {
-	replicas := int32(1)
-	if sts.Spec.Replicas != nil {
-		replicas = *sts.Spec.Replicas
+	pvcs, err := r.listPVCsByClaims(ctx, sts.Namespace, sts.Name, templateClaimNames(sts))
+	if err != nil {
+		logf.FromContext(ctx).Info("failed to list PVCs for anchor cleanup (harmless, stale anchors never match again)", "error", err.Error())
+		return
 	}
-	for _, tmpl := range sts.Spec.VolumeClaimTemplates {
-		for ordinal := int32(0); ordinal < replicas; ordinal++ {
-			pvc := &corev1.PersistentVolumeClaim{}
-			name := drift.PVCName(tmpl.Name, sts.Name, ordinal)
-			if err := r.Get(ctx, types.NamespacedName{Namespace: sts.Namespace, Name: name}, pvc); err != nil {
-				continue
-			}
-			if _, has := pvc.Annotations[recreate.AnchorAnnotation]; !has {
-				continue
-			}
-			orig := pvc.DeepCopy()
-			delete(pvc.Annotations, recreate.AnchorAnnotation)
-			if err := r.Patch(ctx, pvc, client.MergeFrom(orig)); err != nil {
-				logf.FromContext(ctx).Info("failed to clear snapshot anchor (harmless, will never match again)", "pvc", name, "error", err.Error())
-			}
+	for _, cp := range pvcs {
+		pvc := cp.PVC
+		if _, has := pvc.Annotations[recreate.AnchorAnnotation]; !has {
+			continue
+		}
+		orig := pvc.DeepCopy()
+		delete(pvc.Annotations, recreate.AnchorAnnotation)
+		if err := r.Patch(ctx, pvc, client.MergeFrom(orig)); err != nil {
+			logf.FromContext(ctx).Info("failed to clear snapshot anchor (harmless, will never match again)", "pvc", pvc.Name, "error", err.Error())
 		}
 	}
 }
@@ -809,13 +794,20 @@ func (r *Reconciler) defaultStorageClassName(ctx context.Context) (string, error
 // (PVCs are matched by name, not label selector, because the StatefulSet
 // controller does not propagate pod labels onto the PVCs it creates.)
 func (r *Reconciler) listClaimPVCs(ctx context.Context, sts *appsv1.StatefulSet, desired *contract.DesiredSpec) ([]drift.ClaimPVC, error) {
+	return r.listPVCsByClaims(ctx, sts.Namespace, sts.Name, desired.ClaimNames())
+}
+
+// listPVCsByClaims is the single source of truth for "which PVCs belong to
+// this StatefulSet's claims": every caller (drift assessment, snapshot
+// anchoring, anchor verification, anchor cleanup) matches the same set.
+func (r *Reconciler) listPVCsByClaims(ctx context.Context, namespace, stsName string, claims []string) ([]drift.ClaimPVC, error) {
 	list := &corev1.PersistentVolumeClaimList{}
-	if err := r.List(ctx, list, client.InNamespace(sts.Namespace)); err != nil {
+	if err := r.List(ctx, list, client.InNamespace(namespace)); err != nil {
 		return nil, err
 	}
 	var out []drift.ClaimPVC
-	for _, claim := range desired.ClaimNames() {
-		prefix := claim + "-" + sts.Name + "-"
+	for _, claim := range claims {
+		prefix := claim + "-" + stsName + "-"
 		for i := range list.Items {
 			pvc := &list.Items[i]
 			rest, found := strings.CutPrefix(pvc.Name, prefix)
@@ -830,6 +822,15 @@ func (r *Reconciler) listClaimPVCs(ctx context.Context, sts *appsv1.StatefulSet,
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].PVC.Name < out[j].PVC.Name })
 	return out, nil
+}
+
+// templateClaimNames lists a manifest's volumeClaimTemplate names.
+func templateClaimNames(sts *appsv1.StatefulSet) []string {
+	names := make([]string, 0, len(sts.Spec.VolumeClaimTemplates))
+	for _, t := range sts.Spec.VolumeClaimTemplates {
+		names = append(names, t.Name)
+	}
+	return names
 }
 
 // applyPVCPatch patches one PVC's spec toward the desired state.

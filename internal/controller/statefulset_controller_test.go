@@ -814,6 +814,31 @@ func TestSelfRecreateRecoversFromOrphanedSnapshot(t *testing.T) {
 	}
 }
 
+func TestSnapshotAnchoredByHighOrdinalPVCOnly(t *testing.T) {
+	// Only a PVC beyond replicas-1 (retained from a scale-down) survives and
+	// anchors the snapshot. Recovery must still work: verification matches
+	// the same PVC set writeSnapshot anchored, at any ordinal.
+	desired := desiredJSON(t, map[string]map[string]string{"sqlite": {"storage": "200Gi"}})
+	spec, err := contract.ParseDesiredSpec(desired)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := recreate.NewSnapshot(healthySTS(nil), spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f := newFixture(t, snapshot, anchoredPVC("sqlite-broker-5", snapshot))
+	f.r.SelfRecreate = true
+
+	f.reconcile()
+	if f.stsGone() {
+		t.Fatal("snapshot anchored by a high-ordinal PVC must still recreate the StatefulSet")
+	}
+	if _, has := f.getPVC("sqlite-broker-5").Annotations[recreate.AnchorAnnotation]; has {
+		t.Fatal("anchor on the high-ordinal PVC should be cleared after recreation")
+	}
+}
+
 func TestForgedSnapshotIsRejected(t *testing.T) {
 	// An attacker with only ConfigMap write access forges a snapshot for a
 	// StatefulSet that never went through the controller's delete flow. No

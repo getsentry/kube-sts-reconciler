@@ -154,7 +154,13 @@ func assessPVC(a *Assessment, cp ClaimPVC, want contract.ClaimDesired) {
 		if pvc.Spec.VolumeAttributesClassName == nil || *pvc.Spec.VolumeAttributesClassName != *want.VolumeAttributesClassName {
 			patch.NewVAC = want.VolumeAttributesClassName
 		} else if mvs := pvc.Status.ModifyVolumeStatus; mvs != nil {
-			if mvs.Status == corev1.PersistentVolumeClaimModifyVolumeInfeasible {
+			if mvs.TargetVolumeAttributesClassName != *want.VolumeAttributesClassName {
+				// Stale status from a previous modification attempt (possibly
+				// a failed one): the CSI resizer has not yet observed the
+				// current spec. Keep waiting — the convergence timeout bounds
+				// this if the resizer never catches up.
+				a.Waiting[pvc.Name] = fmt.Sprintf("volume modification status still targets VolumeAttributesClass %q; waiting for CSI driver to process %q", mvs.TargetVolumeAttributesClassName, *want.VolumeAttributesClassName)
+			} else if mvs.Status == corev1.PersistentVolumeClaimModifyVolumeInfeasible {
 				a.Infeasible[pvc.Name] = fmt.Sprintf("CSI driver reports modifying volume to VolumeAttributesClass %q is infeasible", mvs.TargetVolumeAttributesClassName)
 			} else {
 				a.Waiting[pvc.Name] = fmt.Sprintf("volume modification to VolumeAttributesClass %q is %s", mvs.TargetVolumeAttributesClassName, mvs.Status)
