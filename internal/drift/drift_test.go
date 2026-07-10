@@ -204,6 +204,25 @@ func TestAssessFileSystemResizePendingIsConvergedEnough(t *testing.T) {
 	}
 }
 
+func TestAssessActiveResizingBlocksConvergence(t *testing.T) {
+	// Capacity already satisfies the request, but the resizer still reports
+	// an in-flight resize: hold off the (destructive) delete until it clears.
+	desired := mustSpec(t, `{"version":1,"claims":{"sqlite":{"storage":"200Gi"}}}`)
+	s := sts(template("sqlite", "200Gi", nil))
+	p := pvc("sqlite-broker-0", "200Gi", "200Gi", nil, nil)
+	p.Status.Conditions = []corev1.PersistentVolumeClaimCondition{{
+		Type:   corev1.PersistentVolumeClaimResizing,
+		Status: corev1.ConditionTrue,
+	}}
+	a := Assess(desired, s, []ClaimPVC{{Claim: "sqlite", PVC: p}})
+	if a.Converged() {
+		t.Fatal("active Resizing condition must block convergence")
+	}
+	if a.PVCStates["sqlite-broker-0"] != "AwaitingConvergence" {
+		t.Errorf("state = %q", a.PVCStates["sqlite-broker-0"])
+	}
+}
+
 func TestAssessDoneClearsEverything(t *testing.T) {
 	desired := mustSpec(t, `{"version":1,"claims":{"sqlite":{"volumeAttributesClassName":"vac-new","storage":"200Gi"}}}`)
 	s := sts(template("sqlite", "200Gi", strp("vac-new")))

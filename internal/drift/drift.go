@@ -181,6 +181,12 @@ func assessPVC(a *Assessment, cp ClaimPVC, want contract.ClaimDesired) {
 				}
 				a.Waiting[pvc.Name] = fmt.Sprintf("waiting for volume expansion to %s (current capacity %s)", want.Storage.String(), capStr)
 			}
+		} else if hasCondition(pvc, corev1.PersistentVolumeClaimResizing) {
+			// Capacity is satisfied but a resize is still marked in flight.
+			// Conforming resizers update capacity and conditions atomically,
+			// so this is defensive — but the next step is a destructive
+			// delete, so wait for the condition to clear.
+			a.Waiting[pvc.Name] = "volume resize still marked in progress despite sufficient capacity"
 		}
 	}
 
