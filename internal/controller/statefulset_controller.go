@@ -283,7 +283,6 @@ func (r *Reconciler) deletePhase(ctx context.Context, sts *appsv1.StatefulSet, a
 
 	msg := fmt.Sprintf("orphan-deleting StatefulSet %s/%s so it can be recreated with updated volumeClaimTemplates", sts.Namespace, sts.Name)
 	log.Info(msg)
-	r.Recorder.Event(sts, corev1.EventTypeNormal, ReasonOrphanDeleted, msg)
 
 	err := r.Delete(ctx, sts,
 		client.PropagationPolicy(metav1.DeletePropagationOrphan),
@@ -298,7 +297,13 @@ func (r *Reconciler) deletePhase(ctx context.Context, sts *appsv1.StatefulSet, a
 		// delete cannot stall if that event was already processed.
 		return ctrl.Result{RequeueAfter: patchRequeue}, nil
 	}
-	return ctrl.Result{}, err
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	// Recorded only after the delete succeeded, so `kubectl describe` never
+	// shows an orphan-delete that did not actually happen.
+	r.Recorder.Event(sts, corev1.EventTypeNormal, ReasonOrphanDeleted, msg)
+	return ctrl.Result{}, nil
 }
 
 // complete clears both reconciler annotations: the terminal transition.

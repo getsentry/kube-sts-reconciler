@@ -82,16 +82,52 @@ starts with `kind-`. It cannot be pointed at a real cluster by accident.
 
 ### Manual poking
 
-With a kind cluster up you can also drive the controller by hand:
+The e2e test cleans up after itself, so a fresh kind cluster has nothing to poke.
+The `sandbox-*` recipes provision a standalone workload: namespace `sandbox` with an
+expandable StorageClass, a VolumeAttributesClass `vac-fast`, and a 1-replica
+StatefulSet `broker` (labeled `service=taskbroker`, so the controller's default
+selector matches) with a mounted 1Gi claim named `data`.
+
+You'll want three terminals — sandbox commands, the CSI simulator, and the controller:
 
 ```sh
-kubectl config use-context kind-sts-reconciler-e2e
-go run ./cmd --label-selector= --dry-run     # watch what it would do
-kubectl annotate sts broker \
-  'sts-reconciler.sentry.io/desired-pvc-spec={"version":1,"claims":{"data":{"storage":"2Gi"}}}'
-kubectl get sts broker -o jsonpath='{.metadata.annotations.sts-reconciler\.sentry\.io/status}'
-kubectl get events --field-selector involvedObject.name=broker
+just kind-up                    # once; kubectl context switches to kind-sts-reconciler-e2e
+just sandbox-up                 # broker STS running with a bound 1Gi PVC
+
+# terminal 2 — the stand-in CSI driver. Without it a non-dry-run reconcile
+# sits in AwaitingConvergence until the timeout: kind has no CSI driver that
+# can actually expand volumes or apply a VAC.
+just sandbox-csisim
+
+# terminal 3 — the controller. Start with --dry-run to preview, then run for real.
+go run ./cmd --dry-run
+go run ./cmd
 ```
 
-Note that without csisim running, a non-dry-run reconcile will sit in
-`AwaitingConvergence` until the timeout — kind has no CSI driver to converge the PVC.
+Then drive a reconcile and watch it move through the state machine:
+
+```sh
+just sandbox-annotate                        # asks for vac-fast + 2Gi (both overridable:
+                                             #   just sandbox-annotate 3Gi vac-fast)
+just sandbox-status                          # Patching -> AwaitingConvergence -> STS deleted
+                                             # (PVC survives with the patched spec)
+
+# Simulate the next deploy: re-apply the STS with matching templates.
+just sandbox-recreate 2Gi vac-fast
+just sandbox-annotate                        # re-stamp, as a deploy manifest would carry it;
+                                             # drift is empty, controller clears both annotations
+just sandbox-status
+```
+
+Useful one-offs while poking:
+
+```sh
+kubectl -n sandbox get sts broker -o jsonpath='{.metadata.annotations.sts-reconciler\.sentry\.io/status}'
+kubectl -n sandbox get events --field-selector involvedObject.name=broker
+kubectl -n sandbox annotate sts broker sts-reconciler.sentry.io/skip=true    # emergency stop
+just sandbox-down                            # tear the sandbox down, keep the cluster
+```
+
+Failure paths are easy to provoke too: annotate with a shrink (`just sandbox-annotate
+512Mi`) and watch the `Failed` status latch, or mark the PVC
+`csisim.sentry.io/infeasible=true` before a VAC change to see the CSI-infeasible path.

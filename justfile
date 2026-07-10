@@ -55,3 +55,53 @@ run-dry-run:
 
 clean:
     go clean ./...
+
+# --- Manual-poking sandbox (docs/testing.md, "Manual poking") ---------------
+# Provisions a workload on the kind cluster so the controller can be driven
+# by hand: namespace `sandbox`, an expandable StorageClass, a
+# VolumeAttributesClass `vac-fast`, and a 1-replica StatefulSet `broker`.
+
+# Create the sandbox namespace, StorageClass, VAC, and broker StatefulSet
+sandbox-up storage="1Gi" vac="":
+    kubectl apply -f hack/sandbox/base.yaml
+    just _sandbox-apply-sts {{storage}} '{{vac}}'
+    kubectl -n sandbox rollout status sts/broker --timeout=180s
+
+# Re-apply the broker StatefulSet with a new template (simulates the next deploy after orphan-delete)
+sandbox-recreate storage vac="":
+    just _sandbox-apply-sts {{storage}} '{{vac}}'
+    kubectl -n sandbox rollout status sts/broker --timeout=180s
+
+_sandbox-apply-sts storage vac:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ -n "{{vac}}" ]; then
+        sed -e 's/__STORAGE__/{{storage}}/' -e 's/__VAC_LINE__/volumeAttributesClassName: {{vac}}/' hack/sandbox/sts.yaml | kubectl apply -f -
+    else
+        sed -e 's/__STORAGE__/{{storage}}/' -e '/__VAC_LINE__/d' hack/sandbox/sts.yaml | kubectl apply -f -
+    fi
+
+# Stamp the desired-pvc-spec annotation on the broker StatefulSet
+sandbox-annotate storage="2Gi" vac="vac-fast":
+    kubectl -n sandbox annotate --overwrite sts broker \
+        'sts-reconciler.sentry.io/desired-pvc-spec={"version":1,"claims":{"data":{"volumeAttributesClassName":"{{vac}}","storage":"{{storage}}"}}}'
+
+# Show reconcile state: annotations, PVC spec vs status, recent events
+sandbox-status:
+    #!/usr/bin/env bash
+    echo "=== StatefulSet annotations ==="
+    kubectl -n sandbox get sts broker -o jsonpath='{.metadata.annotations}' 2>/dev/null | python3 -m json.tool 2>/dev/null || echo "(StatefulSet not found — orphan-deleted, awaiting recreate?)"
+    echo
+    echo "=== PVCs (spec request / VAC -> status capacity / current VAC) ==="
+    kubectl -n sandbox get pvc -o custom-columns='NAME:.metadata.name,REQ:.spec.resources.requests.storage,VAC:.spec.volumeAttributesClassName,CAP:.status.capacity.storage,CURVAC:.status.currentVolumeAttributesClassName' 2>/dev/null
+    echo
+    echo "=== Recent events ==="
+    kubectl -n sandbox get events --sort-by=.lastTimestamp 2>/dev/null | tail -12
+
+# Run the stand-in CSI driver for the sandbox (non-dry-run reconciles need it to converge)
+sandbox-csisim:
+    go run ./cmd/csisim --namespace sandbox
+
+# Delete the sandbox namespace, StorageClass, and VAC
+sandbox-down:
+    kubectl delete -f hack/sandbox/base.yaml --ignore-not-found
