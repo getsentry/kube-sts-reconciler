@@ -53,8 +53,10 @@ go run ./cmd \
 - `self`: the controller snapshots the manifest to a ConfigMap before deleting,
   recreates the StatefulSet itself with the updated `volumeClaimTemplates` (reconciler
   annotations stripped), then removes the snapshot. The ConfigMap makes this
-  crash-safe: a controller restarted mid-flow resumes from it. Requires extra RBAC
-  (`create` on statefulsets, read/write on configmaps).
+  crash-safe: a controller restarted mid-flow resumes from it. Snapshots are
+  anchored by a content hash stamped on the PVCs, so a forged ConfigMap cannot make
+  the controller create arbitrary StatefulSets. Requires extra RBAC (`create` on
+  statefulsets, read/write on configmaps).
 
 ## Development & testing
 

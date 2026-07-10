@@ -718,10 +718,19 @@ func TestSelfRecreateFullLoop(t *testing.T) {
 	}
 }
 
+// anchoredPVC returns a PVC carrying the snapshot's anchor hash, as
+// writeSnapshot would have stamped it before the orphan-delete.
+func anchoredPVC(name string, snapshot *corev1.ConfigMap) *corev1.PersistentVolumeClaim {
+	pvc := boundPVC(name, "fast", "200Gi", "200Gi")
+	pvc.Annotations = map[string]string{recreate.AnchorAnnotation: recreate.SnapshotHash(snapshot)}
+	return pvc
+}
+
 func TestSelfRecreateRecoversFromOrphanedSnapshot(t *testing.T) {
 	// Simulates a controller crash between orphan-delete and recreation: no
-	// StatefulSet, only the snapshot ConfigMap. The reconcile (triggered by
-	// the ConfigMap watch on cache sync) must recreate the StatefulSet.
+	// StatefulSet, only the snapshot ConfigMap and the anchor-stamped PVCs.
+	// The reconcile (triggered by the ConfigMap watch on cache sync) must
+	// recreate the StatefulSet.
 	desired := desiredJSON(t, map[string]map[string]string{"sqlite": {"storage": "200Gi"}})
 	spec, err := contract.ParseDesiredSpec(desired)
 	if err != nil {
@@ -731,7 +740,10 @@ func TestSelfRecreateRecoversFromOrphanedSnapshot(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	f := newFixture(t, snapshot)
+	f := newFixture(t, snapshot,
+		anchoredPVC("sqlite-broker-0", snapshot),
+		anchoredPVC("sqlite-broker-1", snapshot),
+	)
 	f.r.SelfRecreate = true
 
 	// The ConfigMap watch maps the snapshot back to the StatefulSet name.
@@ -745,6 +757,81 @@ func TestSelfRecreateRecoversFromOrphanedSnapshot(t *testing.T) {
 	if got := sts.Spec.VolumeClaimTemplates[0].Spec.Resources.Requests[corev1.ResourceStorage]; got.String() != "200Gi" {
 		t.Fatalf("recovered template storage = %s", got.String())
 	}
+	// Anchors are cleaned up after a successful recreation.
+	if _, has := f.getPVC("sqlite-broker-0").Annotations[recreate.AnchorAnnotation]; has {
+		t.Fatal("anchor annotation should be cleared after recreation")
+	}
+}
+
+func TestForgedSnapshotIsRejected(t *testing.T) {
+	// An attacker with only ConfigMap write access forges a snapshot for a
+	// StatefulSet that never went through the controller's delete flow. No
+	// PVC carries the anchor hash, so recreation must be refused.
+	desired := desiredJSON(t, map[string]map[string]string{"sqlite": {"storage": "200Gi"}})
+	spec, err := contract.ParseDesiredSpec(desired)
+	if err != nil {
+		t.Fatal(err)
+	}
+	forged, err := recreate.NewSnapshot(healthySTS(nil), spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Case 1: no PVCs at all — nothing anchors the snapshot.
+	f := newFixture(t, forged)
+	f.r.SelfRecreate = true
+	f.reconcile()
+	if !f.stsGone() {
+		t.Fatal("unanchored snapshot must not create a StatefulSet")
+	}
+	f.expectEvent(ReasonSnapshotRejected)
+	// The evidence is preserved.
+	if err := f.client.Get(context.Background(), types.NamespacedName{Namespace: testNS, Name: recreate.SnapshotName(testSTS)}, &corev1.ConfigMap{}); err != nil {
+		t.Fatalf("rejected snapshot must be left in place: %v", err)
+	}
+
+	// Case 2: PVCs exist but anchor a different (legitimate) snapshot hash —
+	// e.g. the attacker overwrote the controller's ConfigMap content.
+	pvc := boundPVC("sqlite-broker-0", "fast", "200Gi", "200Gi")
+	pvc.Annotations = map[string]string{recreate.AnchorAnnotation: "sha256:somethingelse"}
+	f = newFixture(t, forged, pvc)
+	f.r.SelfRecreate = true
+	f.reconcile()
+	if !f.stsGone() {
+		t.Fatal("snapshot with mismatched anchor must not create a StatefulSet")
+	}
+	f.expectEvent(ReasonSnapshotRejected)
+}
+
+func TestSnapshotIdentityMismatchIsRejected(t *testing.T) {
+	// The ConfigMap is named/labeled for one StatefulSet but its manifest
+	// declares another: refuse rather than create the impostor.
+	desired := desiredJSON(t, map[string]map[string]string{"sqlite": {"storage": "200Gi"}})
+	spec, err := contract.ParseDesiredSpec(desired)
+	if err != nil {
+		t.Fatal(err)
+	}
+	impostor := healthySTS(nil)
+	impostor.Name = "evil"
+	snapshot, err := recreate.NewSnapshot(impostor, spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Rename the ConfigMap so it claims to be broker's snapshot.
+	snapshot.Name = recreate.SnapshotName(testSTS)
+	snapshot.Labels[recreate.StatefulSetLabel] = testSTS
+
+	f := newFixture(t, snapshot, anchoredPVC("sqlite-broker-0", snapshot))
+	f.r.SelfRecreate = true
+	f.reconcile()
+	if !f.stsGone() {
+		t.Fatal("identity-mismatched snapshot must not create broker")
+	}
+	err = f.client.Get(context.Background(), types.NamespacedName{Namespace: testNS, Name: "evil"}, &appsv1.StatefulSet{})
+	if !apierrors.IsNotFound(err) {
+		t.Fatalf("impostor StatefulSet must not be created either, got %v", err)
+	}
+	f.expectEvent(ReasonSnapshotRejected)
 }
 
 func TestDeployModeDoesNotRecreate(t *testing.T) {

@@ -55,6 +55,8 @@ const (
 	ReasonModifyInfeasible     = "ModifyVolumeInfeasible"
 	ReasonOrphanDeleted        = "OrphanDeleted"
 	ReasonRecreated            = "Recreated"
+	ReasonSnapshotSkipped      = "SnapshotSkipped"
+	ReasonSnapshotRejected     = "SnapshotRejected"
 	ReasonReconcileComplete    = "ReconcileComplete"
 	ReasonDryRun               = "DryRun"
 )
@@ -287,7 +289,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		// PVCs converged; only the StatefulSet's own volumeClaimTemplates
 		// still disagree. Orphan-delete so it can be recreated with matching
 		// templates.
-		return r.deletePhase(ctx, sts, desired, a, status, specHash)
+		return r.deletePhase(ctx, sts, desired, pvcs, a, status, specHash)
 	}
 }
 
@@ -417,7 +419,7 @@ func (r *Reconciler) convergencePhase(ctx context.Context, sts *appsv1.StatefulS
 // the manifest is snapshotted to a ConfigMap first, so the delete's watch
 // event (or a restarted controller finding the snapshot) can recreate the
 // StatefulSet without waiting for a deploy.
-func (r *Reconciler) deletePhase(ctx context.Context, sts *appsv1.StatefulSet, desired *contract.DesiredSpec, a *drift.Assessment, status *contract.Status, specHash string) (ctrl.Result, error) {
+func (r *Reconciler) deletePhase(ctx context.Context, sts *appsv1.StatefulSet, desired *contract.DesiredSpec, pvcs []drift.ClaimPVC, a *drift.Assessment, status *contract.Status, specHash string) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
 
 	if reason := healthGate(sts); reason != "" {
@@ -435,7 +437,14 @@ func (r *Reconciler) deletePhase(ctx context.Context, sts *appsv1.StatefulSet, d
 	}
 
 	if r.SelfRecreate {
-		if err := r.writeSnapshot(ctx, sts, desired); err != nil {
+		if len(pvcs) == 0 {
+			// With no PVCs there is nothing to anchor a snapshot to (see
+			// AnchorAnnotation) — and nothing was patched either, so the next
+			// deploy re-applying the manifest loses nothing. Fall back to
+			// deploy-mode semantics for this StatefulSet.
+			r.Recorder.Event(sts, corev1.EventTypeWarning, ReasonSnapshotSkipped,
+				"no PVCs exist to anchor a recreation snapshot; recreation is left to the next deploy")
+		} else if err := r.writeSnapshot(ctx, sts, desired, pvcs); err != nil {
 			return ctrl.Result{}, fmt.Errorf("writing recreation snapshot: %w", err)
 		}
 	}
@@ -479,10 +488,12 @@ func (r *Reconciler) deletePhase(ctx context.Context, sts *appsv1.StatefulSet, d
 	return ctrl.Result{}, nil
 }
 
-// writeSnapshot persists the recreation manifest before the orphan-delete.
-// Idempotent: an existing snapshot is overwritten, so a retried deletePhase
-// always captures the manifest as of the latest reconcile.
-func (r *Reconciler) writeSnapshot(ctx context.Context, sts *appsv1.StatefulSet, desired *contract.DesiredSpec) error {
+// writeSnapshot persists the recreation manifest before the orphan-delete and
+// anchors its content hash on every existing claim PVC (see
+// recreate.AnchorAnnotation). Idempotent: an existing snapshot is
+// overwritten and the anchors re-stamped, so a retried deletePhase always
+// captures the manifest as of the latest reconcile.
+func (r *Reconciler) writeSnapshot(ctx context.Context, sts *appsv1.StatefulSet, desired *contract.DesiredSpec, pvcs []drift.ClaimPVC) error {
 	cm, err := recreate.NewSnapshot(sts, desired)
 	if err != nil {
 		return err
@@ -502,7 +513,21 @@ func (r *Reconciler) writeSnapshot(ctx context.Context, sts *appsv1.StatefulSet,
 			return err
 		}
 	}
-	logf.FromContext(ctx).Info("wrote recreation snapshot", "configmap", cm.Name)
+	hash := recreate.SnapshotHash(cm)
+	for _, cp := range pvcs {
+		if cp.PVC.Annotations[recreate.AnchorAnnotation] == hash {
+			continue
+		}
+		orig := cp.PVC.DeepCopy()
+		if cp.PVC.Annotations == nil {
+			cp.PVC.Annotations = map[string]string{}
+		}
+		cp.PVC.Annotations[recreate.AnchorAnnotation] = hash
+		if err := r.Patch(ctx, cp.PVC, client.MergeFrom(orig)); err != nil {
+			return fmt.Errorf("anchoring snapshot on PVC %s: %w", cp.PVC.Name, err)
+		}
+	}
+	logf.FromContext(ctx).Info("wrote recreation snapshot", "configmap", cm.Name, "anchoredPVCs", len(pvcs))
 	return nil
 }
 
@@ -528,6 +553,18 @@ func (r *Reconciler) recreateFromSnapshot(ctx context.Context, key types.Namespa
 		log.Error(err, "snapshot is unreadable; leaving it for manual inspection", "configmap", cm.Name)
 		return ctrl.Result{}, nil
 	}
+	if sts.Name != key.Name || sts.Namespace != key.Namespace {
+		r.rejectSnapshot(ctx, cm, fmt.Sprintf("manifest identity %s/%s does not match snapshot key %s", sts.Namespace, sts.Name, key))
+		return ctrl.Result{}, nil
+	}
+	anchored, reason, err := r.snapshotAnchored(ctx, cm, sts)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if !anchored {
+		r.rejectSnapshot(ctx, cm, reason)
+		return ctrl.Result{}, nil
+	}
 
 	if err := r.Create(ctx, sts); err != nil {
 		if apierrors.IsAlreadyExists(err) {
@@ -551,7 +588,78 @@ func (r *Reconciler) recreateFromSnapshot(ctx context.Context, key types.Namespa
 	if err := r.Delete(ctx, cm); err != nil && !apierrors.IsNotFound(err) {
 		return ctrl.Result{}, err
 	}
+	r.clearAnchorsFromPVCs(ctx, sts)
 	return ctrl.Result{}, nil
+}
+
+// snapshotAnchored verifies that the snapshot's content hash was stamped on
+// the StatefulSet's PVCs by the controller before the orphan-delete. This is
+// the trust boundary of self-recreate: PVCs survive the delete window and
+// writing them requires PVC patch rights, so a principal with only ConfigMap
+// access cannot have the controller create an arbitrary StatefulSet. At least
+// one anchored PVC is required, and every existing claim PVC must agree.
+func (r *Reconciler) snapshotAnchored(ctx context.Context, cm *corev1.ConfigMap, sts *appsv1.StatefulSet) (bool, string, error) {
+	want := recreate.SnapshotHash(cm)
+	replicas := int32(1)
+	if sts.Spec.Replicas != nil {
+		replicas = *sts.Spec.Replicas
+	}
+	anchored := 0
+	for _, tmpl := range sts.Spec.VolumeClaimTemplates {
+		for ordinal := int32(0); ordinal < replicas; ordinal++ {
+			pvc := &corev1.PersistentVolumeClaim{}
+			name := drift.PVCName(tmpl.Name, sts.Name, ordinal)
+			err := r.Get(ctx, types.NamespacedName{Namespace: sts.Namespace, Name: name}, pvc)
+			if apierrors.IsNotFound(err) {
+				continue
+			}
+			if err != nil {
+				return false, "", err
+			}
+			if got := pvc.Annotations[recreate.AnchorAnnotation]; got != want {
+				return false, fmt.Sprintf("PVC %s does not anchor this snapshot (anchor %q, want %q)", name, got, want), nil
+			}
+			anchored++
+		}
+	}
+	if anchored == 0 {
+		return false, "no PVC anchors this snapshot; refusing to create a StatefulSet from unverified ConfigMap content", nil
+	}
+	return true, "", nil
+}
+
+// rejectSnapshot records why a snapshot was refused. The ConfigMap is left in
+// place: it is evidence, and deleting it would let a forger retry silently.
+func (r *Reconciler) rejectSnapshot(ctx context.Context, cm *corev1.ConfigMap, reason string) {
+	logf.FromContext(ctx).Info("refusing to recreate from snapshot", "configmap", cm.Name, "reason", reason)
+	r.Recorder.Event(cm, corev1.EventTypeWarning, ReasonSnapshotRejected, reason)
+}
+
+// clearAnchorsFromPVCs removes the anchor annotations once recreation
+// succeeded. Best effort: a leftover anchor is harmless (it never matches a
+// future snapshot's hash).
+func (r *Reconciler) clearAnchorsFromPVCs(ctx context.Context, sts *appsv1.StatefulSet) {
+	replicas := int32(1)
+	if sts.Spec.Replicas != nil {
+		replicas = *sts.Spec.Replicas
+	}
+	for _, tmpl := range sts.Spec.VolumeClaimTemplates {
+		for ordinal := int32(0); ordinal < replicas; ordinal++ {
+			pvc := &corev1.PersistentVolumeClaim{}
+			name := drift.PVCName(tmpl.Name, sts.Name, ordinal)
+			if err := r.Get(ctx, types.NamespacedName{Namespace: sts.Namespace, Name: name}, pvc); err != nil {
+				continue
+			}
+			if _, has := pvc.Annotations[recreate.AnchorAnnotation]; !has {
+				continue
+			}
+			orig := pvc.DeepCopy()
+			delete(pvc.Annotations, recreate.AnchorAnnotation)
+			if err := r.Patch(ctx, pvc, client.MergeFrom(orig)); err != nil {
+				logf.FromContext(ctx).Info("failed to clear snapshot anchor (harmless, will never match again)", "pvc", name, "error", err.Error())
+			}
+		}
+	}
 }
 
 // complete clears both reconciler annotations: the terminal transition.

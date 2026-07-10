@@ -27,6 +27,13 @@ const (
 	// SpecHashAnnotation records which desired-spec content produced the
 	// snapshot, for traceability.
 	SpecHashAnnotation = contract.Domain + "/spec-hash"
+	// AnchorAnnotation is stamped on each of the StatefulSet's PVCs before
+	// the orphan-delete, holding the snapshot's content hash. Recreation
+	// refuses any snapshot that is not anchored this way: PVCs survive the
+	// delete window and forging the anchor requires PVC patch rights, so a
+	// principal with mere ConfigMap write access cannot make the controller
+	// create an arbitrary StatefulSet with its RBAC.
+	AnchorAnnotation = contract.Domain + "/snapshot-hash"
 	// DataKey is the ConfigMap data key holding the manifest.
 	DataKey = "statefulset.json"
 
@@ -66,6 +73,12 @@ func NewSnapshot(sts *appsv1.StatefulSet, desired *contract.DesiredSpec) (*corev
 		},
 		Data: map[string]string{DataKey: string(raw)},
 	}, nil
+}
+
+// SnapshotHash returns the content hash of a snapshot's manifest data — the
+// value stamped on PVCs as the recreation anchor.
+func SnapshotHash(cm *corev1.ConfigMap) string {
+	return contract.HashValue(cm.Data[DataKey])
 }
 
 // FromSnapshot decodes the StatefulSet manifest stored in a snapshot ConfigMap.

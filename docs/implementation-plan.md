@@ -189,6 +189,17 @@ crash-recovery signal: a ConfigMap watch re-enqueues the StatefulSet on controll
 restart, so a crash between delete and recreate resumes instead of stranding the
 workload.
 
+**Snapshot trust boundary:** ConfigMap content is never trusted on its own — otherwise
+anyone with ConfigMap write access could have the controller create an arbitrary
+StatefulSet with its RBAC. Before the orphan-delete, the controller stamps the
+snapshot's content hash onto every claim PVC
+(`sts-reconciler.sentry.io/snapshot-hash`); recreation requires at least one PVC — and
+every existing claim PVC — to carry the matching anchor, and the manifest's identity
+must match the snapshot's key. PVCs survive the delete window by design and forging the
+anchor requires PVC patch rights, so ConfigMap access alone cannot cross the boundary.
+Rejected snapshots are left in place (as evidence) with a `SnapshotRejected` warning
+event on the ConfigMap.
+
 Recreate race (`deploy` mode): if sentry-kube re-applies while the controller is still in
 `Patching`, the apply necessarily carries the *old* `volumeClaimTemplates` (the new ones are
 rejected while the old STS exists — that's the whole premise), so nothing conflicts; the
