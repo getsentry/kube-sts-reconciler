@@ -403,6 +403,57 @@ func TestMissingVACWaitsThenProceeds(t *testing.T) {
 	}
 }
 
+func TestDefaultStorageClassExpansionGate(t *testing.T) {
+	desired := desiredJSON(t, map[string]map[string]string{"sqlite": {"storage": "200Gi"}})
+	defaultPVC := func() *corev1.PersistentVolumeClaim {
+		pvc := boundPVC("sqlite-broker-0", "ignored", "100Gi", "100Gi")
+		pvc.Spec.StorageClassName = nil // relies on the cluster default
+		return pvc
+	}
+	markDefault := func(sc *storagev1.StorageClass) *storagev1.StorageClass {
+		sc.Annotations = map[string]string{"storageclass.kubernetes.io/is-default-class": "true"}
+		return sc
+	}
+
+	// Expandable default: patch proceeds.
+	f := newFixture(t,
+		healthySTS(map[string]string{contract.DesiredSpecAnnotation: desired}),
+		defaultPVC(),
+		markDefault(expandableSC("cluster-default")),
+	)
+	f.reconcile()
+	if got := f.getPVC("sqlite-broker-0").Spec.Resources.Requests[corev1.ResourceStorage]; got.String() != "200Gi" {
+		t.Fatalf("expandable default SC should allow the patch, got %s", got.String())
+	}
+
+	// Non-expandable default: latched Failed, same as a named rigid class.
+	rigid := markDefault(expandableSC("cluster-default"))
+	rigid.AllowVolumeExpansion = nil
+	f = newFixture(t,
+		healthySTS(map[string]string{contract.DesiredSpecAnnotation: desired}),
+		defaultPVC(),
+		rigid,
+	)
+	f.reconcile()
+	if st := f.status(); st == nil || st.State != contract.StateFailed {
+		t.Fatalf("status = %+v, want Failed for non-expandable default SC", st)
+	}
+	f.expectEvent(ReasonExpansionUnsupported)
+
+	// No default at all: expansion is impossible, latched Failed.
+	f = newFixture(t,
+		healthySTS(map[string]string{contract.DesiredSpecAnnotation: desired}),
+		defaultPVC(),
+	)
+	f.reconcile()
+	if st := f.status(); st == nil || st.State != contract.StateFailed {
+		t.Fatalf("status = %+v, want Failed when no default SC exists", st)
+	}
+	if got := f.getPVC("sqlite-broker-0").Spec.Resources.Requests[corev1.ResourceStorage]; got.String() != "100Gi" {
+		t.Fatal("PVC must not be patched when expansion is impossible")
+	}
+}
+
 func TestExpansionForbiddenBySC(t *testing.T) {
 	desired := desiredJSON(t, map[string]map[string]string{"sqlite": {"storage": "200Gi"}})
 	sc := expandableSC("rigid")

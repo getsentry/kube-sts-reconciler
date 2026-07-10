@@ -187,7 +187,7 @@ func (r *Reconciler) gateTimeout() time.Duration {
 // +kubebuilder:rbac:groups=apps,resources=statefulsets,verbs=get;list;watch;patch;delete
 // +kubebuilder:rbac:groups=core,resources=persistentvolumeclaims,verbs=get;list;watch;patch
 // +kubebuilder:rbac:groups=storage.k8s.io,resources=volumeattributesclasses,verbs=get;list;watch
-// +kubebuilder:rbac:groups=storage.k8s.io,resources=storageclasses,verbs=get
+// +kubebuilder:rbac:groups=storage.k8s.io,resources=storageclasses,verbs=get;list;watch
 // +kubebuilder:rbac:groups=core,resources=events,verbs=create;patch
 //
 // Self-recreate mode only — omit from the role when running --recreate-mode=deploy:
@@ -737,9 +737,26 @@ func (r *Reconciler) checkPrerequisites(ctx context.Context, desired *contract.D
 				return "", err
 			}
 		}
-		if p.NewStorage != "" && p.PVC.Spec.StorageClassName != nil {
-			scName := *p.PVC.Spec.StorageClassName
-			if scName == "" || checkedSCs[scName] {
+		if p.NewStorage != "" {
+			scName := ""
+			if p.PVC.Spec.StorageClassName != nil {
+				scName = *p.PVC.Spec.StorageClassName
+			} else {
+				// A nil storageClassName means the PVC follows the cluster
+				// default StorageClass; resolve it so a non-expandable
+				// default is rejected as cleanly as an explicitly named one.
+				name, err := r.defaultStorageClassName(ctx)
+				if err != nil {
+					return "", err
+				}
+				scName = name
+			}
+			if scName == "" {
+				// Explicitly classless (statically bound) or no default
+				// exists: the resize admission would reject the patch anyway.
+				return "", fmt.Errorf("PVC %s has no StorageClass (and no cluster default); volume expansion is impossible", p.PVC.Name)
+			}
+			if checkedSCs[scName] {
 				continue
 			}
 			checkedSCs[scName] = true
@@ -758,6 +775,29 @@ func (r *Reconciler) checkPrerequisites(ctx context.Context, desired *contract.D
 		}
 	}
 	return "", nil
+}
+
+// defaultStorageClassName resolves the cluster's default StorageClass,
+// mirroring the API server's choice when several are marked default (the most
+// recently created wins). Returns "" when none is marked default.
+func (r *Reconciler) defaultStorageClassName(ctx context.Context) (string, error) {
+	list := &storagev1.StorageClassList{}
+	if err := r.List(ctx, list); err != nil {
+		return "", err
+	}
+	name := ""
+	var newest time.Time
+	for i := range list.Items {
+		sc := &list.Items[i]
+		if sc.Annotations["storageclass.kubernetes.io/is-default-class"] != "true" {
+			continue
+		}
+		if name == "" || sc.CreationTimestamp.Time.After(newest) {
+			name = sc.Name
+			newest = sc.CreationTimestamp.Time
+		}
+	}
+	return name, nil
 }
 
 // listClaimPVCs finds every existing PVC the StatefulSet controller created
