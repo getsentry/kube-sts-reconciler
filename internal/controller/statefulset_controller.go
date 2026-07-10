@@ -107,6 +107,10 @@ type Reconciler struct {
 	mu            sync.Mutex
 	waitAnchors   map[string]waitAnchor
 	failedLatches map[string]failedLatch
+	// rejectedSnapshots dedupes SnapshotRejected warnings per ConfigMap:
+	// the snapshot watch re-enqueues on every resync, but an unchanged
+	// rejected snapshot should alert once, not forever.
+	rejectedSnapshots map[string]string
 }
 
 type failedLatch struct {
@@ -245,9 +249,12 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		return ctrl.Result{}, nil
 	}
 	if latched := r.failedLatchFor(sts, specHash); latched != nil {
-		// The failure already alerted but its status write failed; keep
-		// retrying the write quietly instead of re-evaluating (and
-		// re-alerting) the whole reconcile.
+		// The failure already alerted. In dry-run there is nothing to
+		// persist; otherwise keep retrying the status write quietly instead
+		// of re-evaluating (and re-alerting) the whole reconcile.
+		if r.DryRun {
+			return ctrl.Result{}, nil
+		}
 		return ctrl.Result{}, r.writeStatus(ctx, sts, latched)
 	}
 
@@ -549,6 +556,7 @@ func (r *Reconciler) recreateFromSnapshot(ctx context.Context, key types.Namespa
 	cm := &corev1.ConfigMap{}
 	err := r.Get(ctx, types.NamespacedName{Namespace: key.Namespace, Name: recreate.SnapshotName(key.Name)}, cm)
 	if apierrors.IsNotFound(err) {
+		r.clearRejectedSnapshot(key.Namespace, recreate.SnapshotName(key.Name))
 		return ctrl.Result{}, nil // nothing pending for this StatefulSet
 	}
 	if err != nil {
@@ -597,6 +605,7 @@ func (r *Reconciler) recreateFromSnapshot(ctx context.Context, key types.Namespa
 	if err := r.Delete(ctx, cm); err != nil && !apierrors.IsNotFound(err) {
 		return ctrl.Result{}, err
 	}
+	r.clearRejectedSnapshot(cm.Namespace, cm.Name)
 	r.clearAnchorsFromPVCs(ctx, sts)
 	return ctrl.Result{}, nil
 }
@@ -629,9 +638,29 @@ func (r *Reconciler) snapshotAnchored(ctx context.Context, cm *corev1.ConfigMap,
 
 // rejectSnapshot records why a snapshot was refused. The ConfigMap is left in
 // place: it is evidence, and deleting it would let a forger retry silently.
+// The warning event is emitted once per distinct snapshot content + reason —
+// the ConfigMap watch re-enqueues on every resync, and an unchanged rejected
+// snapshot should not alert forever.
 func (r *Reconciler) rejectSnapshot(ctx context.Context, cm *corev1.ConfigMap, reason string) {
 	logf.FromContext(ctx).Info("refusing to recreate from snapshot", "configmap", cm.Name, "reason", reason)
-	r.Recorder.Event(cm, corev1.EventTypeWarning, ReasonSnapshotRejected, reason)
+	key := cm.Namespace + "/" + cm.Name
+	sig := recreate.SnapshotHash(cm) + "|" + reason
+	r.mu.Lock()
+	if r.rejectedSnapshots == nil {
+		r.rejectedSnapshots = map[string]string{}
+	}
+	duplicate := r.rejectedSnapshots[key] == sig
+	r.rejectedSnapshots[key] = sig
+	r.mu.Unlock()
+	if !duplicate {
+		r.Recorder.Event(cm, corev1.EventTypeWarning, ReasonSnapshotRejected, reason)
+	}
+}
+
+func (r *Reconciler) clearRejectedSnapshot(namespace, name string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	delete(r.rejectedSnapshots, namespace+"/"+name)
 }
 
 // clearAnchorsFromPVCs removes the anchor annotations once recreation
@@ -679,10 +708,6 @@ func (r *Reconciler) complete(ctx context.Context, sts *appsv1.StatefulSet) (ctr
 func (r *Reconciler) fail(ctx context.Context, sts *appsv1.StatefulSet, specHash, reason, message string, pvcStates map[string]string) (ctrl.Result, error) {
 	logf.FromContext(ctx).Info("reconcile failed", "reason", reason, "message", message)
 	r.Recorder.Event(sts, corev1.EventTypeWarning, reason, message)
-	if r.DryRun {
-		return ctrl.Result{}, nil
-	}
-	r.clearAnchor(sts.Namespace, sts.Name)
 	st := &contract.Status{
 		Version:          contract.SupportedVersion,
 		State:            contract.StateFailed,
@@ -691,9 +716,14 @@ func (r *Reconciler) fail(ctx context.Context, sts *appsv1.StatefulSet, specHash
 		Reason:           fmt.Sprintf("%s: %s", reason, message),
 		LastTransition:   time.Now().UTC(),
 	}
-	// Latch in memory before the write: if the write fails and is retried,
-	// the retry persists this status quietly instead of re-alerting.
+	// Latch in memory before the write — and in dry-run too, where no status
+	// is ever persisted: either way, later reconciles short-circuit at the
+	// top of Reconcile instead of re-alerting.
 	r.latchFailed(sts, st)
+	if r.DryRun {
+		return ctrl.Result{}, nil
+	}
+	r.clearAnchor(sts.Namespace, sts.Name)
 	return ctrl.Result{}, r.writeStatus(ctx, sts, st)
 }
 

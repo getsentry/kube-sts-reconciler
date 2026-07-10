@@ -567,6 +567,55 @@ func TestDryRunMutatesNothing(t *testing.T) {
 	f.expectEvent(ReasonDryRun)
 }
 
+func TestDryRunFailureAlertsOnce(t *testing.T) {
+	// An invalid spec in dry-run cannot persist a Failed status, so the
+	// in-memory latch must prevent every subsequent reconcile from
+	// re-emitting the same warning.
+	desired := desiredJSON(t, map[string]map[string]string{"sqlite": {"storage": "50Gi"}}) // shrink
+	f := newFixture(t,
+		healthySTS(map[string]string{contract.DesiredSpecAnnotation: desired}),
+		boundPVC("sqlite-broker-0", "fast", "100Gi", "100Gi"),
+		expandableSC("fast"),
+	)
+	f.r.DryRun = true
+
+	f.reconcile()
+	f.expectEvent(ReasonInvalidDesiredSpec)
+	if f.status() != nil {
+		t.Fatal("dry-run must not write status annotations")
+	}
+
+	f.reconcile()
+	f.reconcile()
+	if events := f.drainEvents(); len(events) != 0 {
+		t.Fatalf("dry-run failure must alert once, got %v", events)
+	}
+}
+
+func TestRejectedSnapshotAlertsOnce(t *testing.T) {
+	desired := desiredJSON(t, map[string]map[string]string{"sqlite": {"storage": "200Gi"}})
+	spec, err := contract.ParseDesiredSpec(desired)
+	if err != nil {
+		t.Fatal(err)
+	}
+	forged, err := recreate.NewSnapshot(healthySTS(nil), spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f := newFixture(t, forged) // no anchoring PVCs: rejected
+	f.r.SelfRecreate = true
+
+	f.reconcile()
+	f.expectEvent(ReasonSnapshotRejected)
+
+	// The ConfigMap watch keeps enqueueing; the refusal must not re-alert.
+	f.reconcile()
+	f.reconcile()
+	if events := f.drainEvents(); len(events) != 0 {
+		t.Fatalf("unchanged rejected snapshot must alert once, got %v", events)
+	}
+}
+
 func TestStaleStatusIsCleared(t *testing.T) {
 	st := &contract.Status{Version: 1, State: contract.StatePatching, LastTransition: time.Now()}
 	encoded, _ := st.Encode()
