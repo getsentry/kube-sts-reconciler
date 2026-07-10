@@ -89,6 +89,15 @@ func TestValidateRejectsShrink(t *testing.T) {
 	}
 }
 
+func TestValidateRejectsShrinkAgainstTemplate(t *testing.T) {
+	// No PVCs at all: the shrink must still be caught against the template.
+	desired := mustSpec(t, `{"version":1,"claims":{"sqlite":{"storage":"10Gi"}}}`)
+	err := Validate(desired, sts(template("sqlite", "100Gi", nil)), nil)
+	if err == nil || !strings.Contains(err.Error(), "volumeClaimTemplate request") {
+		t.Fatalf("err = %v", err)
+	}
+}
+
 func TestValidateAcceptsExpansion(t *testing.T) {
 	desired := mustSpec(t, `{"version":1,"claims":{"sqlite":{"storage":"200Gi"}}}`)
 	pvcs := []ClaimPVC{{Claim: "sqlite", PVC: pvc("sqlite-broker-0", "100Gi", "100Gi", nil, nil)}}

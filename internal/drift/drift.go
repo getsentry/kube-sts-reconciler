@@ -88,8 +88,10 @@ func (a *Assessment) FailureReason() string {
 
 // Validate rejects desired specs the controller must never act on: claims
 // that are not part of the StatefulSet, and storage shrinks (Kubernetes only
-// supports expansion). Returns a terminal error; the caller marks the
-// reconcile Failed without mutating anything.
+// supports expansion). Shrinks are checked against both the live PVCs and the
+// StatefulSet's own template, so a shrink is rejected even when no PVCs exist
+// yet. Returns a terminal error; the caller marks the reconcile Failed
+// without mutating anything.
 func Validate(desired *contract.DesiredSpec, sts *appsv1.StatefulSet, pvcs []ClaimPVC) error {
 	templates := map[string]*corev1.PersistentVolumeClaim{}
 	for i := range sts.Spec.VolumeClaimTemplates {
@@ -97,8 +99,17 @@ func Validate(desired *contract.DesiredSpec, sts *appsv1.StatefulSet, pvcs []Cla
 		templates[t.Name] = t
 	}
 	for _, name := range desired.ClaimNames() {
-		if _, ok := templates[name]; !ok {
+		t, ok := templates[name]
+		if !ok {
 			return fmt.Errorf("claim %q is not a volumeClaimTemplate of StatefulSet %s", name, sts.Name)
+		}
+		want := desired.Claims[name]
+		if want.Storage == nil {
+			continue
+		}
+		if cur, ok := t.Spec.Resources.Requests[corev1.ResourceStorage]; ok && want.Storage.Cmp(cur) < 0 {
+			return fmt.Errorf("claim %q: desired storage %s is smaller than the volumeClaimTemplate request %s (Kubernetes only supports expansion)",
+				name, want.Storage.String(), cur.String())
 		}
 	}
 	for _, cp := range pvcs {
@@ -164,7 +175,11 @@ func assessPVC(a *Assessment, cp ClaimPVC, want contract.ClaimDesired) {
 			if hasCondition(pvc, corev1.PersistentVolumeClaimFileSystemResizePending) {
 				fsResizePending = true
 			} else {
-				a.Waiting[pvc.Name] = fmt.Sprintf("waiting for volume expansion to %s (current capacity %s)", want.Storage.String(), cap.String())
+				capStr := "unknown"
+				if ok {
+					capStr = cap.String()
+				}
+				a.Waiting[pvc.Name] = fmt.Sprintf("waiting for volume expansion to %s (current capacity %s)", want.Storage.String(), capStr)
 			}
 		}
 	}

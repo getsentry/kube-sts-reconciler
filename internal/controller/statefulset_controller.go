@@ -25,6 +25,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -65,6 +66,12 @@ type Reconciler struct {
 	client.Client
 	Recorder record.EventRecorder
 
+	// Selector scopes the controller: StatefulSets not matching it are never
+	// reconciled, regardless of annotations. The informer predicate applies
+	// the same filter; this field enforces it on every other path too (PVC
+	// watch mapping, direct requeues). Nil selects everything.
+	Selector labels.Selector
+
 	// DryRun disables every mutation. Intended actions are logged and emitted
 	// as events, but neither PVCs, nor the StatefulSet, nor its annotations
 	// are touched.
@@ -100,6 +107,9 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 	if sts.DeletionTimestamp != nil {
+		return ctrl.Result{}, nil
+	}
+	if r.Selector != nil && !r.Selector.Matches(labels.Set(sts.Labels)) {
 		return ctrl.Result{}, nil
 	}
 	if sts.Annotations[contract.SkipAnnotation] == "true" {
@@ -203,7 +213,13 @@ func (r *Reconciler) patchPhase(ctx context.Context, sts *appsv1.StatefulSet, de
 
 	if r.DryRun {
 		// Nothing was mutated, so re-assessing would do the same again;
-		// dry-run stops here for this StatefulSet.
+		// preview the rest of the flow, then stop for this StatefulSet.
+		msg := "dry-run: would then wait for the CSI driver to converge PVC status"
+		if a.TemplateDrift {
+			msg += fmt.Sprintf(", then orphan-delete StatefulSet %s/%s for recreation with updated volumeClaimTemplates", sts.Namespace, sts.Name)
+		}
+		log.Info(msg)
+		r.Recorder.Event(sts, corev1.EventTypeNormal, ReasonDryRun, msg)
 		return ctrl.Result{}, nil
 	}
 	if err := r.writeStatus(ctx, sts, &contract.Status{
@@ -273,9 +289,14 @@ func (r *Reconciler) deletePhase(ctx context.Context, sts *appsv1.StatefulSet, a
 		client.PropagationPolicy(metav1.DeletePropagationOrphan),
 		client.Preconditions{UID: &sts.UID, ResourceVersion: &sts.ResourceVersion},
 	)
-	if apierrors.IsNotFound(err) || apierrors.IsConflict(err) {
-		// Someone else deleted or changed it; the next watch event re-runs us.
+	if apierrors.IsNotFound(err) {
 		return ctrl.Result{}, nil
+	}
+	if apierrors.IsConflict(err) {
+		// The object changed between our read and the delete. The update's
+		// watch event usually re-runs us anyway; requeue explicitly so the
+		// delete cannot stall if that event was already processed.
+		return ctrl.Result{RequeueAfter: patchRequeue}, nil
 	}
 	return ctrl.Result{}, err
 }
@@ -372,29 +393,35 @@ func (r *Reconciler) checkPrerequisites(ctx context.Context, desired *contract.D
 	return "", nil
 }
 
-// listClaimPVCs fetches the PVCs the StatefulSet controller created for the
-// claims named in the desired spec. Missing PVCs are skipped: the recreated
-// StatefulSet will create them from the updated template.
+// listClaimPVCs finds every existing PVC the StatefulSet controller created
+// for the claims named in the desired spec, matching the
+// <claim>-<name>-<ordinal> naming convention for ANY ordinal — not just
+// 0..replicas-1. PVCs retained from a scale-down must be patched too, or a
+// later scale-up would resurrect them with a stale spec. Missing PVCs need no
+// handling: the recreated StatefulSet creates them from the updated template.
+// (PVCs are matched by name, not label selector, because the StatefulSet
+// controller does not propagate pod labels onto the PVCs it creates.)
 func (r *Reconciler) listClaimPVCs(ctx context.Context, sts *appsv1.StatefulSet, desired *contract.DesiredSpec) ([]drift.ClaimPVC, error) {
-	replicas := int32(1)
-	if sts.Spec.Replicas != nil {
-		replicas = *sts.Spec.Replicas
+	list := &corev1.PersistentVolumeClaimList{}
+	if err := r.List(ctx, list, client.InNamespace(sts.Namespace)); err != nil {
+		return nil, err
 	}
 	var out []drift.ClaimPVC
 	for _, claim := range desired.ClaimNames() {
-		for ordinal := int32(0); ordinal < replicas; ordinal++ {
-			pvc := &corev1.PersistentVolumeClaim{}
-			name := drift.PVCName(claim, sts.Name, ordinal)
-			err := r.Get(ctx, types.NamespacedName{Namespace: sts.Namespace, Name: name}, pvc)
-			if apierrors.IsNotFound(err) {
+		prefix := claim + "-" + sts.Name + "-"
+		for i := range list.Items {
+			pvc := &list.Items[i]
+			rest, found := strings.CutPrefix(pvc.Name, prefix)
+			if !found {
 				continue
 			}
-			if err != nil {
-				return nil, err
+			if _, err := strconv.Atoi(rest); err != nil {
+				continue
 			}
 			out = append(out, drift.ClaimPVC{Claim: claim, PVC: pvc})
 		}
 	}
+	sort.Slice(out, func(i, j int) bool { return out[i].PVC.Name < out[j].PVC.Name })
 	return out, nil
 }
 
@@ -513,6 +540,14 @@ func (r *Reconciler) SetupWithManager(mgr ctrl.Manager, labelSelector string) er
 			return err
 		}
 		stsPredicates = append(stsPredicates, p)
+		// Also enforce the selector inside Reconcile and the PVC mapper: the
+		// informer predicate alone does not cover reconciles enqueued via the
+		// PVC watch.
+		compiled, err := metav1.LabelSelectorAsSelector(sel)
+		if err != nil {
+			return err
+		}
+		r.Selector = compiled
 	}
 
 	return ctrl.NewControllerManagedBy(mgr).
@@ -539,6 +574,9 @@ func (r *Reconciler) mapPVCToStatefulSet(ctx context.Context, obj client.Object)
 	for i := range stsList.Items {
 		sts := &stsList.Items[i]
 		if _, has := sts.Annotations[contract.DesiredSpecAnnotation]; !has {
+			continue
+		}
+		if r.Selector != nil && !r.Selector.Matches(labels.Set(sts.Labels)) {
 			continue
 		}
 		for _, tmpl := range sts.Spec.VolumeClaimTemplates {

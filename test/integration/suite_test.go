@@ -303,6 +303,33 @@ func simulateCSI(t *testing.T, ns, name string) {
 	}
 }
 
+// finalizeOrphanDelete plays the garbage collector's role (absent in
+// envtest): PropagationPolicy=Orphan parks the deleted object behind the
+// "orphan" finalizer, and the GC controller removes it after orphaning
+// dependents. Nothing in these tests is owned by the StatefulSet, so the
+// finalizer can be cleared as soon as it appears. Returns true once the
+// StatefulSet is fully gone.
+func finalizeOrphanDelete(t *testing.T, ns string) bool {
+	t.Helper()
+	ctx := ctxT(t)
+	sts := &appsv1.StatefulSet{}
+	err := k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: stsName}, sts)
+	if apierrors.IsNotFound(err) {
+		return true
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sts.DeletionTimestamp != nil && len(sts.Finalizers) > 0 {
+		orig := sts.DeepCopy()
+		sts.Finalizers = nil
+		if err := k8sClient.Patch(ctx, sts, client.MergeFrom(orig)); err != nil && !apierrors.IsNotFound(err) {
+			t.Fatal(err)
+		}
+	}
+	return false
+}
+
 func getStatus(t *testing.T, ns string) *contract.Status {
 	sts := &appsv1.StatefulSet{}
 	if err := k8sClient.Get(ctxT(t), types.NamespacedName{Namespace: ns, Name: stsName}, sts); err != nil {
@@ -353,8 +380,7 @@ func TestFullReconcileLoop(t *testing.T) {
 		for _, name := range []string{"data-broker-0", "data-broker-1"} {
 			simulateCSI(t, ns, name)
 		}
-		err := k8sClient.Get(ctxT(t), types.NamespacedName{Namespace: ns, Name: stsName}, &appsv1.StatefulSet{})
-		return apierrors.IsNotFound(err), nil
+		return finalizeOrphanDelete(t, ns), nil
 	})
 
 	// PVCs survived and keep their patched spec.

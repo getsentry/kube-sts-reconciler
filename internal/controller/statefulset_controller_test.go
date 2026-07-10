@@ -525,6 +525,70 @@ func TestStaleStatusIsCleared(t *testing.T) {
 	}
 }
 
+func TestScaledDownPVCsArePatchedToo(t *testing.T) {
+	// Replicas is 2, but a PVC from a previous scale-up to 3 still exists.
+	// It must be patched as well, or a later scale-up would resurrect it
+	// with a stale spec.
+	desired := desiredJSON(t, map[string]map[string]string{"sqlite": {"storage": "200Gi"}})
+	f := newFixture(t,
+		healthySTS(map[string]string{contract.DesiredSpecAnnotation: desired}),
+		boundPVC("sqlite-broker-0", "fast", "100Gi", "100Gi"),
+		boundPVC("sqlite-broker-1", "fast", "100Gi", "100Gi"),
+		boundPVC("sqlite-broker-2", "fast", "100Gi", "100Gi"), // retained from scale-down
+		expandableSC("fast"),
+	)
+	f.reconcile()
+	for _, name := range []string{"sqlite-broker-0", "sqlite-broker-1", "sqlite-broker-2"} {
+		if got := f.getPVC(name).Spec.Resources.Requests[corev1.ResourceStorage]; got.String() != "200Gi" {
+			t.Fatalf("%s not patched: %s", name, got.String())
+		}
+	}
+}
+
+func TestSelectorEnforcedOutsideInformer(t *testing.T) {
+	// The informer predicate filters watch events, but reconciles can also be
+	// enqueued via the PVC mapper; the reconciler itself must enforce the
+	// selector on those paths.
+	desired := desiredJSON(t, map[string]map[string]string{"sqlite": {"storage": "200Gi"}})
+	sts := healthySTS(map[string]string{contract.DesiredSpecAnnotation: desired})
+	sts.Labels = map[string]string{"service": "other"}
+	f := newFixture(t, sts, boundPVC("sqlite-broker-0", "fast", "100Gi", "100Gi"), expandableSC("fast"))
+	sel, err := metav1.ParseToLabelSelector("service=taskbroker")
+	if err != nil {
+		t.Fatal(err)
+	}
+	compiled, err := metav1.LabelSelectorAsSelector(sel)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.r.Selector = compiled
+
+	f.reconcile()
+	if got := f.getPVC("sqlite-broker-0").Spec.Resources.Requests[corev1.ResourceStorage]; got.String() != "100Gi" {
+		t.Fatal("out-of-scope StatefulSet must not be reconciled")
+	}
+	// The PVC mapper must not enqueue out-of-scope StatefulSets either.
+	if reqs := f.r.mapPVCToStatefulSet(context.Background(), f.getPVC("sqlite-broker-0")); len(reqs) != 0 {
+		t.Fatalf("mapper enqueued out-of-scope STS: %v", reqs)
+	}
+}
+
+func TestShrinkRejectedEvenWithoutPVCs(t *testing.T) {
+	// No PVCs exist at all; the shrink must still be caught (against the
+	// volumeClaimTemplate) instead of sailing through to completion.
+	desired := desiredJSON(t, map[string]map[string]string{"sqlite": {"storage": "50Gi"}})
+	f := newFixture(t, healthySTS(map[string]string{contract.DesiredSpecAnnotation: desired}))
+	f.reconcile()
+	st := f.status()
+	if st == nil || st.State != contract.StateFailed {
+		t.Fatalf("status = %+v, want Failed", st)
+	}
+	sts := f.getSTS()
+	if _, has := sts.Annotations[contract.DesiredSpecAnnotation]; !has {
+		t.Fatal("desired annotation must not be cleared on a rejected shrink")
+	}
+}
+
 func TestMapPVCToStatefulSet(t *testing.T) {
 	desired := desiredJSON(t, map[string]map[string]string{"sqlite": {"storage": "200Gi"}})
 	f := newFixture(t, healthySTS(map[string]string{contract.DesiredSpecAnnotation: desired}))
