@@ -1,0 +1,50 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Check formatting
+        run: test -z "$(gofmt -l cmd internal test)"
+      - name: Vet (all build tags)
+        run: make vet
+      - name: Unit tests
+        run: go test -race ./internal/...
+
+  integration:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Integration tests (envtest)
+        run: make test-integration
+
+  e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Create kind cluster
+        uses: helm/kind-action@v1
+        with:
+          cluster_name: sts-reconciler-e2e
+          node_image: kindest/node:v1.33.1
+          config: hack/kind-config.yaml
+      - name: E2E tests
+        run: make test-e2e

@@ -1,0 +1,558 @@
+// Package controller implements the annotation-driven StatefulSet volume
+// reconciler. The state machine is level-triggered: every reconcile recomputes
+// the world from scratch and acts on the first thing that is out of place.
+// The status annotation is an observability record and timeout anchor, never
+// a source of truth.
+//
+// Order of operations (see docs/implementation-plan.md §4):
+//
+//	patch PVC specs -> wait for CSI convergence -> orphan-delete the
+//	StatefulSet -> (recreated externally) -> drift empty -> clear annotations
+package controller
+
+import (
+	"context"
+	"fmt"
+	"sort"
+	"strconv"
+	"strings"
+	"time"
+
+	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
+	storagev1 "k8s.io/api/storage/v1"
+	storagev1beta1 "k8s.io/api/storage/v1beta1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/record"
+	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
+	logf "sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+
+	"github.com/getsentry/kube-sts-reconciler/internal/contract"
+	"github.com/getsentry/kube-sts-reconciler/internal/drift"
+)
+
+// Event reasons emitted on the StatefulSet.
+const (
+	ReasonInvalidDesiredSpec   = "InvalidDesiredSpec"
+	ReasonUnhealthy            = "UnhealthyStatefulSet"
+	ReasonMissingVAC           = "MissingVolumeAttributesClass"
+	ReasonExpansionUnsupported = "ExpansionUnsupported"
+	ReasonPVCPatched           = "PVCPatched"
+	ReasonAwaitingConvergence  = "AwaitingConvergence"
+	ReasonConvergenceTimeout   = "ConvergenceTimeout"
+	ReasonModifyInfeasible     = "ModifyVolumeInfeasible"
+	ReasonOrphanDeleted        = "OrphanDeleted"
+	ReasonReconcileComplete    = "ReconcileComplete"
+	ReasonDryRun               = "DryRun"
+)
+
+const (
+	patchRequeue       = 5 * time.Second
+	convergenceRequeue = 15 * time.Second
+	gateRequeue        = 30 * time.Second
+)
+
+// Reconciler reconciles StatefulSets carrying the desired-pvc-spec annotation.
+type Reconciler struct {
+	client.Client
+	Recorder record.EventRecorder
+
+	// DryRun disables every mutation. Intended actions are logged and emitted
+	// as events, but neither PVCs, nor the StatefulSet, nor its annotations
+	// are touched.
+	DryRun bool
+
+	// ConvergenceTimeout bounds how long PVC status may lag the patched spec
+	// before the reconcile is marked Failed. Zero means 10 minutes.
+	ConvergenceTimeout time.Duration
+}
+
+func (r *Reconciler) convergenceTimeout() time.Duration {
+	if r.ConvergenceTimeout <= 0 {
+		return 10 * time.Minute
+	}
+	return r.ConvergenceTimeout
+}
+
+// +kubebuilder:rbac:groups=apps,resources=statefulsets,verbs=get;list;watch;patch;delete
+// +kubebuilder:rbac:groups=core,resources=persistentvolumeclaims,verbs=get;list;watch;patch
+// +kubebuilder:rbac:groups=storage.k8s.io,resources=volumeattributesclasses,verbs=get;list;watch
+// +kubebuilder:rbac:groups=storage.k8s.io,resources=storageclasses,verbs=get
+// +kubebuilder:rbac:groups=core,resources=events,verbs=create;patch
+
+// Reconcile implements the level-triggered state machine.
+func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+	log := logf.FromContext(ctx)
+
+	sts := &appsv1.StatefulSet{}
+	if err := r.Get(ctx, req.NamespacedName, sts); err != nil {
+		// A deleted StatefulSet needs nothing from us: PVCs are already
+		// converged by the time we delete, and the terminal cleanup happens
+		// when the recreated StatefulSet shows empty drift.
+		return ctrl.Result{}, client.IgnoreNotFound(err)
+	}
+	if sts.DeletionTimestamp != nil {
+		return ctrl.Result{}, nil
+	}
+	if sts.Annotations[contract.SkipAnnotation] == "true" {
+		log.Info("skip annotation set, ignoring StatefulSet")
+		return ctrl.Result{}, nil
+	}
+
+	raw, ok := sts.Annotations[contract.DesiredSpecAnnotation]
+	if !ok {
+		// No desired spec. Clear any stale status annotation left behind
+		// (e.g. an operator removed the desired spec to abort).
+		if _, has := sts.Annotations[contract.StatusAnnotation]; has {
+			return ctrl.Result{}, r.removeAnnotations(ctx, sts, contract.StatusAnnotation)
+		}
+		return ctrl.Result{}, nil
+	}
+
+	specHash := contract.HashValue(raw)
+	status := r.currentStatus(sts)
+	if status != nil && status.State == contract.StateFailed && status.ObservedSpecHash == specHash {
+		// Failed is latched per desired-spec content: no retries (and no
+		// repeated warning events) until the operator changes or removes the
+		// desired spec.
+		return ctrl.Result{}, nil
+	}
+
+	desired, err := contract.ParseDesiredSpec(raw)
+	if err != nil {
+		return r.fail(ctx, sts, specHash, ReasonInvalidDesiredSpec, err.Error(), nil)
+	}
+	if status != nil && status.ObservedSpecHash != "" && status.ObservedSpecHash != specHash {
+		// The desired spec changed mid-flight; restart the state machine from
+		// a clean assessment. Nothing to undo: all completed patches were
+		// toward a spec the operator has since replaced, and the fresh
+		// assessment below recomputes everything against the new spec.
+		log.Info("desired spec changed mid-flight, reassessing", "oldHash", status.ObservedSpecHash, "newHash", specHash)
+		status = nil
+	}
+
+	pvcs, err := r.listClaimPVCs(ctx, sts, desired)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+
+	if err := drift.Validate(desired, sts, pvcs); err != nil {
+		return r.fail(ctx, sts, specHash, ReasonInvalidDesiredSpec, err.Error(), nil)
+	}
+
+	a := drift.Assess(desired, sts, pvcs)
+	if a.Failed() {
+		return r.fail(ctx, sts, specHash, ReasonModifyInfeasible, a.FailureReason(), a.PVCStates)
+	}
+
+	switch {
+	case a.Done():
+		return r.complete(ctx, sts)
+	case !a.SpecsMatch():
+		return r.patchPhase(ctx, sts, desired, a, specHash)
+	case !a.Converged():
+		return r.convergencePhase(ctx, sts, a, status, specHash)
+	default:
+		// PVCs converged; only the StatefulSet's own volumeClaimTemplates
+		// still disagree. Orphan-delete so it can be recreated with matching
+		// templates.
+		return r.deletePhase(ctx, sts, a)
+	}
+}
+
+// patchPhase validates prerequisites and patches every drifted PVC spec.
+func (r *Reconciler) patchPhase(ctx context.Context, sts *appsv1.StatefulSet, desired *contract.DesiredSpec, a *drift.Assessment, specHash string) (ctrl.Result, error) {
+	log := logf.FromContext(ctx)
+
+	if reason := healthGate(sts); reason != "" {
+		r.Recorder.Event(sts, corev1.EventTypeWarning, ReasonUnhealthy, "refusing to reconcile volumes: "+reason)
+		return ctrl.Result{RequeueAfter: gateRequeue}, nil
+	}
+
+	retryReason, err := r.checkPrerequisites(ctx, desired, a)
+	if err != nil {
+		return r.fail(ctx, sts, specHash, ReasonExpansionUnsupported, err.Error(), a.PVCStates)
+	}
+	if retryReason != "" {
+		r.Recorder.Event(sts, corev1.EventTypeWarning, ReasonMissingVAC, retryReason)
+		return ctrl.Result{RequeueAfter: gateRequeue}, nil
+	}
+
+	for _, p := range a.Patches {
+		if r.DryRun {
+			msg := fmt.Sprintf("dry-run: would patch PVC %s (%s)", p.PVC.Name, describePatch(p))
+			log.Info(msg)
+			r.Recorder.Event(sts, corev1.EventTypeNormal, ReasonDryRun, msg)
+			continue
+		}
+		if err := r.applyPVCPatch(ctx, p); err != nil {
+			return ctrl.Result{}, fmt.Errorf("patching PVC %s: %w", p.PVC.Name, err)
+		}
+		msg := fmt.Sprintf("patched PVC %s (%s)", p.PVC.Name, describePatch(p))
+		log.Info(msg)
+		r.Recorder.Event(sts, corev1.EventTypeNormal, ReasonPVCPatched, msg)
+	}
+
+	if r.DryRun {
+		// Nothing was mutated, so re-assessing would do the same again;
+		// dry-run stops here for this StatefulSet.
+		return ctrl.Result{}, nil
+	}
+	if err := r.writeStatus(ctx, sts, &contract.Status{
+		Version:          contract.SupportedVersion,
+		State:            contract.StatePatching,
+		ObservedSpecHash: specHash,
+		PVCs:             a.PVCStates,
+		LastTransition:   time.Now().UTC(),
+	}); err != nil {
+		return ctrl.Result{}, err
+	}
+	return ctrl.Result{RequeueAfter: patchRequeue}, nil
+}
+
+// convergencePhase waits for PVC status to catch up with the patched specs,
+// bounded by the convergence timeout.
+func (r *Reconciler) convergencePhase(ctx context.Context, sts *appsv1.StatefulSet, a *drift.Assessment, status *contract.Status, specHash string) (ctrl.Result, error) {
+	if r.DryRun {
+		return ctrl.Result{}, nil
+	}
+
+	// Anchor the timeout at the first entry into AwaitingConvergence for this
+	// spec hash; preserve it across reconciles.
+	transition := time.Now().UTC()
+	if status != nil && status.State == contract.StateAwaitingConvergence && status.ObservedSpecHash == specHash {
+		transition = status.LastTransition
+		if time.Since(transition) > r.convergenceTimeout() {
+			reason := fmt.Sprintf("PVCs did not converge within %s: %s", r.convergenceTimeout(), waitingSummary(a))
+			return r.fail(ctx, sts, specHash, ReasonConvergenceTimeout, reason, a.PVCStates)
+		}
+	}
+
+	if err := r.writeStatus(ctx, sts, &contract.Status{
+		Version:          contract.SupportedVersion,
+		State:            contract.StateAwaitingConvergence,
+		ObservedSpecHash: specHash,
+		PVCs:             a.PVCStates,
+		LastTransition:   transition,
+	}); err != nil {
+		return ctrl.Result{}, err
+	}
+	return ctrl.Result{RequeueAfter: convergenceRequeue}, nil
+}
+
+// deletePhase orphan-deletes the StatefulSet. This is the only destructive
+// step and it runs last, once every PVC is verified converged.
+func (r *Reconciler) deletePhase(ctx context.Context, sts *appsv1.StatefulSet, a *drift.Assessment) (ctrl.Result, error) {
+	log := logf.FromContext(ctx)
+
+	if reason := healthGate(sts); reason != "" {
+		r.Recorder.Event(sts, corev1.EventTypeWarning, ReasonUnhealthy, "refusing to orphan-delete: "+reason)
+		return ctrl.Result{RequeueAfter: gateRequeue}, nil
+	}
+
+	if r.DryRun {
+		msg := fmt.Sprintf("dry-run: would orphan-delete StatefulSet %s/%s (PVCs converged, volumeClaimTemplates still drifted)", sts.Namespace, sts.Name)
+		log.Info(msg)
+		r.Recorder.Event(sts, corev1.EventTypeNormal, ReasonDryRun, msg)
+		return ctrl.Result{}, nil
+	}
+
+	msg := fmt.Sprintf("orphan-deleting StatefulSet %s/%s so it can be recreated with updated volumeClaimTemplates", sts.Namespace, sts.Name)
+	log.Info(msg)
+	r.Recorder.Event(sts, corev1.EventTypeNormal, ReasonOrphanDeleted, msg)
+
+	err := r.Delete(ctx, sts,
+		client.PropagationPolicy(metav1.DeletePropagationOrphan),
+		client.Preconditions{UID: &sts.UID, ResourceVersion: &sts.ResourceVersion},
+	)
+	if apierrors.IsNotFound(err) || apierrors.IsConflict(err) {
+		// Someone else deleted or changed it; the next watch event re-runs us.
+		return ctrl.Result{}, nil
+	}
+	return ctrl.Result{}, err
+}
+
+// complete clears both reconciler annotations: the terminal transition.
+func (r *Reconciler) complete(ctx context.Context, sts *appsv1.StatefulSet) (ctrl.Result, error) {
+	if r.DryRun {
+		msg := "dry-run: PVCs and volumeClaimTemplates match desired spec; would clear reconciler annotations"
+		logf.FromContext(ctx).Info(msg)
+		r.Recorder.Event(sts, corev1.EventTypeNormal, ReasonDryRun, msg)
+		return ctrl.Result{}, nil
+	}
+	if err := r.removeAnnotations(ctx, sts, contract.DesiredSpecAnnotation, contract.StatusAnnotation); err != nil {
+		return ctrl.Result{}, err
+	}
+	r.Recorder.Event(sts, corev1.EventTypeNormal, ReasonReconcileComplete, "PVCs match desired spec; reconciliation complete")
+	logf.FromContext(ctx).Info("reconciliation complete", "statefulset", sts.Name)
+	return ctrl.Result{}, nil
+}
+
+// fail latches a terminal failure into the status annotation and emits a
+// warning event. No requeue: the latch holds until the desired spec changes.
+func (r *Reconciler) fail(ctx context.Context, sts *appsv1.StatefulSet, specHash, reason, message string, pvcStates map[string]string) (ctrl.Result, error) {
+	logf.FromContext(ctx).Info("reconcile failed", "reason", reason, "message", message)
+	r.Recorder.Event(sts, corev1.EventTypeWarning, reason, message)
+	if r.DryRun {
+		return ctrl.Result{}, nil
+	}
+	err := r.writeStatus(ctx, sts, &contract.Status{
+		Version:          contract.SupportedVersion,
+		State:            contract.StateFailed,
+		ObservedSpecHash: specHash,
+		PVCs:             pvcStates,
+		Reason:           fmt.Sprintf("%s: %s", reason, message),
+		LastTransition:   time.Now().UTC(),
+	})
+	return ctrl.Result{}, err
+}
+
+// healthGate returns a non-empty reason when the StatefulSet is in no state
+// to have its storage reconciled.
+func healthGate(sts *appsv1.StatefulSet) string {
+	replicas := int32(1)
+	if sts.Spec.Replicas != nil {
+		replicas = *sts.Spec.Replicas
+	}
+	if replicas > 0 && sts.Status.ReadyReplicas == 0 {
+		return fmt.Sprintf("StatefulSet has 0 ready replicas (want %d)", replicas)
+	}
+	if sts.Status.CurrentRevision != sts.Status.UpdateRevision {
+		return "StatefulSet has a rolling update in progress"
+	}
+	return ""
+}
+
+// checkPrerequisites verifies cluster-level preconditions for the pending
+// patches. It returns (retryReason, nil) for conditions that may resolve on
+// their own (a VAC that has not been created yet) and a non-nil error for
+// terminal ones (StorageClass forbids expansion).
+func (r *Reconciler) checkPrerequisites(ctx context.Context, desired *contract.DesiredSpec, a *drift.Assessment) (string, error) {
+	checkedVACs := map[string]bool{}
+	checkedSCs := map[string]bool{}
+	for _, p := range a.Patches {
+		if p.NewVAC != nil && !checkedVACs[*p.NewVAC] {
+			checkedVACs[*p.NewVAC] = true
+			vac := &storagev1beta1.VolumeAttributesClass{}
+			if err := r.Get(ctx, types.NamespacedName{Name: *p.NewVAC}, vac); err != nil {
+				if apierrors.IsNotFound(err) {
+					return fmt.Sprintf("VolumeAttributesClass %q does not exist yet; waiting for it to be created", *p.NewVAC), nil
+				}
+				return "", err
+			}
+		}
+		if p.NewStorage != "" && p.PVC.Spec.StorageClassName != nil {
+			scName := *p.PVC.Spec.StorageClassName
+			if scName == "" || checkedSCs[scName] {
+				continue
+			}
+			checkedSCs[scName] = true
+			sc := &storagev1.StorageClass{}
+			if err := r.Get(ctx, types.NamespacedName{Name: scName}, sc); err != nil {
+				if apierrors.IsNotFound(err) {
+					// Unusual, but not ours to fix; the expansion patch would
+					// fail server-side anyway. Treat as terminal.
+					return "", fmt.Errorf("StorageClass %q of PVC %s not found", scName, p.PVC.Name)
+				}
+				return "", err
+			}
+			if sc.AllowVolumeExpansion == nil || !*sc.AllowVolumeExpansion {
+				return "", fmt.Errorf("StorageClass %q does not allow volume expansion (required to grow PVC %s)", scName, p.PVC.Name)
+			}
+		}
+	}
+	return "", nil
+}
+
+// listClaimPVCs fetches the PVCs the StatefulSet controller created for the
+// claims named in the desired spec. Missing PVCs are skipped: the recreated
+// StatefulSet will create them from the updated template.
+func (r *Reconciler) listClaimPVCs(ctx context.Context, sts *appsv1.StatefulSet, desired *contract.DesiredSpec) ([]drift.ClaimPVC, error) {
+	replicas := int32(1)
+	if sts.Spec.Replicas != nil {
+		replicas = *sts.Spec.Replicas
+	}
+	var out []drift.ClaimPVC
+	for _, claim := range desired.ClaimNames() {
+		for ordinal := int32(0); ordinal < replicas; ordinal++ {
+			pvc := &corev1.PersistentVolumeClaim{}
+			name := drift.PVCName(claim, sts.Name, ordinal)
+			err := r.Get(ctx, types.NamespacedName{Namespace: sts.Namespace, Name: name}, pvc)
+			if apierrors.IsNotFound(err) {
+				continue
+			}
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, drift.ClaimPVC{Claim: claim, PVC: pvc})
+		}
+	}
+	return out, nil
+}
+
+// applyPVCPatch patches one PVC's spec toward the desired state.
+func (r *Reconciler) applyPVCPatch(ctx context.Context, p drift.Patch) error {
+	orig := p.PVC.DeepCopy()
+	if p.NewVAC != nil {
+		p.PVC.Spec.VolumeAttributesClassName = p.NewVAC
+	}
+	if p.NewStorage != "" {
+		qty, err := resource.ParseQuantity(p.NewStorage)
+		if err != nil {
+			return err
+		}
+		if p.PVC.Spec.Resources.Requests == nil {
+			p.PVC.Spec.Resources.Requests = corev1.ResourceList{}
+		}
+		p.PVC.Spec.Resources.Requests[corev1.ResourceStorage] = qty
+	}
+	return r.Patch(ctx, p.PVC, client.MergeFrom(orig))
+}
+
+// writeStatus persists the status annotation, skipping the write when nothing
+// meaningful changed (so status writes cannot hot-loop the watch).
+func (r *Reconciler) writeStatus(ctx context.Context, sts *appsv1.StatefulSet, next *contract.Status) error {
+	if cur := r.currentStatus(sts); cur != nil &&
+		cur.State == next.State &&
+		cur.ObservedSpecHash == next.ObservedSpecHash &&
+		cur.Reason == next.Reason &&
+		mapsEqual(cur.PVCs, next.PVCs) {
+		return nil
+	}
+	encoded, err := next.Encode()
+	if err != nil {
+		return err
+	}
+	orig := sts.DeepCopy()
+	if sts.Annotations == nil {
+		sts.Annotations = map[string]string{}
+	}
+	sts.Annotations[contract.StatusAnnotation] = encoded
+	return r.Patch(ctx, sts, client.MergeFrom(orig))
+}
+
+func (r *Reconciler) removeAnnotations(ctx context.Context, sts *appsv1.StatefulSet, keys ...string) error {
+	orig := sts.DeepCopy()
+	for _, k := range keys {
+		delete(sts.Annotations, k)
+	}
+	return r.Patch(ctx, sts, client.MergeFrom(orig))
+}
+
+func (r *Reconciler) currentStatus(sts *appsv1.StatefulSet) *contract.Status {
+	raw, ok := sts.Annotations[contract.StatusAnnotation]
+	if !ok {
+		return nil
+	}
+	status, err := contract.ParseStatus(raw)
+	if err != nil {
+		// A corrupt status is recoverable: the state machine recomputes
+		// everything anyway.
+		return nil
+	}
+	return status
+}
+
+func describePatch(p drift.Patch) string {
+	var parts []string
+	if p.NewVAC != nil {
+		parts = append(parts, "volumeAttributesClassName="+*p.NewVAC)
+	}
+	if p.NewStorage != "" {
+		parts = append(parts, "storage="+p.NewStorage)
+	}
+	return strings.Join(parts, ", ")
+}
+
+func waitingSummary(a *drift.Assessment) string {
+	names := make([]string, 0, len(a.Waiting))
+	for name := range a.Waiting {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	var parts []string
+	for _, name := range names {
+		parts = append(parts, fmt.Sprintf("%s: %s", name, a.Waiting[name]))
+	}
+	return strings.Join(parts, "; ")
+}
+
+func mapsEqual(a, b map[string]string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for k, v := range a {
+		if b[k] != v {
+			return false
+		}
+	}
+	return true
+}
+
+// SetupWithManager wires the reconciler: a primary watch on StatefulSets
+// (filtered by labelSelector when non-empty) and a secondary watch on PVCs
+// mapped back to the StatefulSet they belong to, so CSI status updates
+// trigger prompt reconciles instead of relying on requeue polling.
+func (r *Reconciler) SetupWithManager(mgr ctrl.Manager, labelSelector string) error {
+	stsPredicates := []predicate.Predicate{}
+	if labelSelector != "" {
+		sel, err := metav1.ParseToLabelSelector(labelSelector)
+		if err != nil {
+			return fmt.Errorf("invalid label selector %q: %w", labelSelector, err)
+		}
+		p, err := predicate.LabelSelectorPredicate(*sel)
+		if err != nil {
+			return err
+		}
+		stsPredicates = append(stsPredicates, p)
+	}
+
+	return ctrl.NewControllerManagedBy(mgr).
+		Named("sts-volume-reconciler").
+		For(&appsv1.StatefulSet{}, builder.WithPredicates(stsPredicates...)).
+		Watches(&corev1.PersistentVolumeClaim{}, handler.EnqueueRequestsFromMapFunc(r.mapPVCToStatefulSet)).
+		Complete(r)
+}
+
+// mapPVCToStatefulSet maps a PVC event to the annotated StatefulSet that owns
+// it, using the <claim>-<name>-<ordinal> naming convention. Only StatefulSets
+// currently carrying the desired-spec annotation are considered, keeping the
+// fan-out tiny.
+func (r *Reconciler) mapPVCToStatefulSet(ctx context.Context, obj client.Object) []reconcile.Request {
+	pvc, ok := obj.(*corev1.PersistentVolumeClaim)
+	if !ok {
+		return nil
+	}
+	stsList := &appsv1.StatefulSetList{}
+	if err := r.List(ctx, stsList, client.InNamespace(pvc.Namespace)); err != nil {
+		return nil
+	}
+	var reqs []reconcile.Request
+	for i := range stsList.Items {
+		sts := &stsList.Items[i]
+		if _, has := sts.Annotations[contract.DesiredSpecAnnotation]; !has {
+			continue
+		}
+		for _, tmpl := range sts.Spec.VolumeClaimTemplates {
+			prefix := tmpl.Name + "-" + sts.Name + "-"
+			rest, found := strings.CutPrefix(pvc.Name, prefix)
+			if !found {
+				continue
+			}
+			if _, err := strconv.Atoi(rest); err != nil {
+				continue
+			}
+			reqs = append(reqs, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: sts.Namespace, Name: sts.Name}})
+			break
+		}
+	}
+	return reqs
+}
