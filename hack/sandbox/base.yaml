@@ -1,0 +1,26 @@
+# Sandbox environment for driving the controller by hand on a kind cluster.
+# Applied by `just sandbox-up`. See docs/testing.md ("Manual poking").
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: sandbox
+---
+# Expandable StorageClass backed by kind's local-path provisioner. local-path
+# handles provisioning; the csisim runner (just sandbox-csisim) handles what
+# it cannot: converging PVC status after expansion / VAC changes.
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: sandbox-expandable
+provisioner: rancher.io/local-path
+volumeBindingMode: WaitForFirstConsumer
+allowVolumeExpansion: true
+---
+apiVersion: storage.k8s.io/v1beta1
+kind: VolumeAttributesClass
+metadata:
+  name: vac-fast
+driverName: sim.csi.sentry.io
+parameters:
+  iops: "15000"
+  throughput: "140"
