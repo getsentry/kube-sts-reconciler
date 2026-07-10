@@ -16,6 +16,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -49,6 +50,7 @@ const (
 	ReasonPVCPatched           = "PVCPatched"
 	ReasonAwaitingConvergence  = "AwaitingConvergence"
 	ReasonConvergenceTimeout   = "ConvergenceTimeout"
+	ReasonHealthGateTimeout    = "HealthGateTimeout"
 	ReasonModifyInfeasible     = "ModifyVolumeInfeasible"
 	ReasonOrphanDeleted        = "OrphanDeleted"
 	ReasonReconcileComplete    = "ReconcileComplete"
@@ -80,6 +82,48 @@ type Reconciler struct {
 	// ConvergenceTimeout bounds how long PVC status may lag the patched spec
 	// before the reconcile is marked Failed. Zero means 10 minutes.
 	ConvergenceTimeout time.Duration
+
+	// GateTimeout bounds how long the health gate may block a reconcile
+	// before it is marked Failed instead of retrying forever. Zero means 10
+	// minutes.
+	GateTimeout time.Duration
+
+	// waitAnchors is an in-memory fallback for the timeout anchors normally
+	// persisted in the status annotation, so a timeout still fires even when
+	// annotation writes keep failing. Losing it on restart only extends a
+	// timeout, never shortens one.
+	mu          sync.Mutex
+	waitAnchors map[string]waitAnchor
+}
+
+type waitAnchor struct {
+	specHash string
+	state    contract.State
+	at       time.Time
+}
+
+// anchorTime returns when this StatefulSet first entered (specHash, state),
+// as far as this process has observed. The entry is replaced whenever the
+// spec hash or state changes.
+func (r *Reconciler) anchorTime(sts *appsv1.StatefulSet, specHash string, state contract.State) time.Time {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.waitAnchors == nil {
+		r.waitAnchors = map[string]waitAnchor{}
+	}
+	key := sts.Namespace + "/" + sts.Name
+	if a, ok := r.waitAnchors[key]; ok && a.specHash == specHash && a.state == state {
+		return a.at
+	}
+	now := time.Now().UTC()
+	r.waitAnchors[key] = waitAnchor{specHash: specHash, state: state, at: now}
+	return now
+}
+
+func (r *Reconciler) clearAnchor(namespace, name string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	delete(r.waitAnchors, namespace+"/"+name)
 }
 
 func (r *Reconciler) convergenceTimeout() time.Duration {
@@ -87,6 +131,13 @@ func (r *Reconciler) convergenceTimeout() time.Duration {
 		return 10 * time.Minute
 	}
 	return r.ConvergenceTimeout
+}
+
+func (r *Reconciler) gateTimeout() time.Duration {
+	if r.GateTimeout <= 0 {
+		return 10 * time.Minute
+	}
+	return r.GateTimeout
 }
 
 // +kubebuilder:rbac:groups=apps,resources=statefulsets,verbs=get;list;watch;patch;delete
@@ -104,6 +155,9 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		// A deleted StatefulSet needs nothing from us: PVCs are already
 		// converged by the time we delete, and the terminal cleanup happens
 		// when the recreated StatefulSet shows empty drift.
+		if apierrors.IsNotFound(err) {
+			r.clearAnchor(req.Namespace, req.Name)
+		}
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 	if sts.DeletionTimestamp != nil {
@@ -167,24 +221,52 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	case a.Done():
 		return r.complete(ctx, sts)
 	case !a.SpecsMatch():
-		return r.patchPhase(ctx, sts, desired, a, specHash)
+		return r.patchPhase(ctx, sts, desired, a, status, specHash)
 	case !a.Converged():
 		return r.convergencePhase(ctx, sts, a, status, specHash)
 	default:
 		// PVCs converged; only the StatefulSet's own volumeClaimTemplates
 		// still disagree. Orphan-delete so it can be recreated with matching
 		// templates.
-		return r.deletePhase(ctx, sts, a)
+		return r.deletePhase(ctx, sts, a, status, specHash)
 	}
 }
 
+// gateBlocked handles a closed health gate: warn, record the Blocked state,
+// and retry — but only for so long. A gate that stays closed past the gate
+// timeout latches Failed so the reconcile cannot stall silently forever.
+func (r *Reconciler) gateBlocked(ctx context.Context, sts *appsv1.StatefulSet, status *contract.Status, specHash, reason string, pvcStates map[string]string) (ctrl.Result, error) {
+	r.Recorder.Event(sts, corev1.EventTypeWarning, ReasonUnhealthy, reason)
+	if r.DryRun {
+		return ctrl.Result{RequeueAfter: gateRequeue}, nil
+	}
+	transition := r.anchorTime(sts, specHash, contract.StateBlocked)
+	if status != nil && status.State == contract.StateBlocked && status.ObservedSpecHash == specHash && status.LastTransition.Before(transition) {
+		transition = status.LastTransition
+	}
+	if time.Since(transition) > r.gateTimeout() {
+		return r.fail(ctx, sts, specHash, ReasonHealthGateTimeout,
+			fmt.Sprintf("health gate blocked reconciliation for more than %s: %s", r.gateTimeout(), reason), pvcStates)
+	}
+	if err := r.writeStatus(ctx, sts, &contract.Status{
+		Version:          contract.SupportedVersion,
+		State:            contract.StateBlocked,
+		ObservedSpecHash: specHash,
+		PVCs:             pvcStates,
+		Reason:           reason,
+		LastTransition:   transition,
+	}); err != nil {
+		return ctrl.Result{}, err
+	}
+	return ctrl.Result{RequeueAfter: gateRequeue}, nil
+}
+
 // patchPhase validates prerequisites and patches every drifted PVC spec.
-func (r *Reconciler) patchPhase(ctx context.Context, sts *appsv1.StatefulSet, desired *contract.DesiredSpec, a *drift.Assessment, specHash string) (ctrl.Result, error) {
+func (r *Reconciler) patchPhase(ctx context.Context, sts *appsv1.StatefulSet, desired *contract.DesiredSpec, a *drift.Assessment, status *contract.Status, specHash string) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
 
 	if reason := healthGate(sts); reason != "" {
-		r.Recorder.Event(sts, corev1.EventTypeWarning, ReasonUnhealthy, "refusing to reconcile volumes: "+reason)
-		return ctrl.Result{RequeueAfter: gateRequeue}, nil
+		return r.gateBlocked(ctx, sts, status, specHash, "refusing to reconcile volumes: "+reason, a.PVCStates)
 	}
 
 	retryReason, err := r.checkPrerequisites(ctx, desired, a)
@@ -242,14 +324,21 @@ func (r *Reconciler) convergencePhase(ctx context.Context, sts *appsv1.StatefulS
 	}
 
 	// Anchor the timeout at the first entry into AwaitingConvergence for this
-	// spec hash; preserve it across reconciles.
-	transition := time.Now().UTC()
-	if status != nil && status.State == contract.StateAwaitingConvergence && status.ObservedSpecHash == specHash {
+	// spec hash. The in-memory anchor backs up the persisted one so the
+	// timeout still fires even if the status write below keeps failing (in
+	// which case a fresh anchor would otherwise reset the clock on every
+	// reconcile).
+	transition := r.anchorTime(sts, specHash, contract.StateAwaitingConvergence)
+	if status != nil && status.State == contract.StateAwaitingConvergence && status.ObservedSpecHash == specHash && status.LastTransition.Before(transition) {
 		transition = status.LastTransition
-		if time.Since(transition) > r.convergenceTimeout() {
-			reason := fmt.Sprintf("PVCs did not converge within %s: %s", r.convergenceTimeout(), waitingSummary(a))
-			return r.fail(ctx, sts, specHash, ReasonConvergenceTimeout, reason, a.PVCStates)
-		}
+	}
+	if time.Since(transition) > r.convergenceTimeout() {
+		reason := fmt.Sprintf("PVCs did not converge within %s: %s", r.convergenceTimeout(), waitingSummary(a))
+		return r.fail(ctx, sts, specHash, ReasonConvergenceTimeout, reason, a.PVCStates)
+	}
+	if status == nil || status.State != contract.StateAwaitingConvergence {
+		r.Recorder.Event(sts, corev1.EventTypeNormal, ReasonAwaitingConvergence,
+			"PVC specs match desired spec; waiting for the CSI driver to converge PVC status")
 	}
 
 	if err := r.writeStatus(ctx, sts, &contract.Status{
@@ -266,12 +355,11 @@ func (r *Reconciler) convergencePhase(ctx context.Context, sts *appsv1.StatefulS
 
 // deletePhase orphan-deletes the StatefulSet. This is the only destructive
 // step and it runs last, once every PVC is verified converged.
-func (r *Reconciler) deletePhase(ctx context.Context, sts *appsv1.StatefulSet, a *drift.Assessment) (ctrl.Result, error) {
+func (r *Reconciler) deletePhase(ctx context.Context, sts *appsv1.StatefulSet, a *drift.Assessment, status *contract.Status, specHash string) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
 
 	if reason := healthGate(sts); reason != "" {
-		r.Recorder.Event(sts, corev1.EventTypeWarning, ReasonUnhealthy, "refusing to orphan-delete: "+reason)
-		return ctrl.Result{RequeueAfter: gateRequeue}, nil
+		return r.gateBlocked(ctx, sts, status, specHash, "refusing to orphan-delete: "+reason, a.PVCStates)
 	}
 
 	if r.DryRun {
@@ -279,6 +367,19 @@ func (r *Reconciler) deletePhase(ctx context.Context, sts *appsv1.StatefulSet, a
 		log.Info(msg)
 		r.Recorder.Event(sts, corev1.EventTypeNormal, ReasonDryRun, msg)
 		return ctrl.Result{}, nil
+	}
+
+	// Record the Deleting state first: if the delete fails or conflicts, the
+	// annotation shows where the flow stopped. On success it simply vanishes
+	// with the object.
+	if err := r.writeStatus(ctx, sts, &contract.Status{
+		Version:          contract.SupportedVersion,
+		State:            contract.StateDeleting,
+		ObservedSpecHash: specHash,
+		PVCs:             a.PVCStates,
+		LastTransition:   time.Now().UTC(),
+	}); err != nil {
+		return ctrl.Result{}, err
 	}
 
 	msg := fmt.Sprintf("orphan-deleting StatefulSet %s/%s so it can be recreated with updated volumeClaimTemplates", sts.Namespace, sts.Name)
@@ -300,6 +401,7 @@ func (r *Reconciler) deletePhase(ctx context.Context, sts *appsv1.StatefulSet, a
 	if err != nil {
 		return ctrl.Result{}, err
 	}
+	r.clearAnchor(sts.Namespace, sts.Name)
 	// Recorded only after the delete succeeded, so `kubectl describe` never
 	// shows an orphan-delete that did not actually happen.
 	r.Recorder.Event(sts, corev1.EventTypeNormal, ReasonOrphanDeleted, msg)
@@ -317,6 +419,7 @@ func (r *Reconciler) complete(ctx context.Context, sts *appsv1.StatefulSet) (ctr
 	if err := r.removeAnnotations(ctx, sts, contract.DesiredSpecAnnotation, contract.StatusAnnotation); err != nil {
 		return ctrl.Result{}, err
 	}
+	r.clearAnchor(sts.Namespace, sts.Name)
 	r.Recorder.Event(sts, corev1.EventTypeNormal, ReasonReconcileComplete, "PVCs match desired spec; reconciliation complete")
 	logf.FromContext(ctx).Info("reconciliation complete", "statefulset", sts.Name)
 	return ctrl.Result{}, nil
@@ -330,6 +433,7 @@ func (r *Reconciler) fail(ctx context.Context, sts *appsv1.StatefulSet, specHash
 	if r.DryRun {
 		return ctrl.Result{}, nil
 	}
+	r.clearAnchor(sts.Namespace, sts.Name)
 	err := r.writeStatus(ctx, sts, &contract.Status{
 		Version:          contract.SupportedVersion,
 		State:            contract.StateFailed,

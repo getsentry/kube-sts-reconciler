@@ -268,9 +268,12 @@ whose PVCs it has just verified as converged.
 5. **Delete-last ordering:** the only destructive step happens after PVCs are verified
    converged, minimizing the STS-less window (seconds in `self` mode, one deploy cycle in
    `deploy` mode).
-6. **Timeout:** stuck in `AwaitingConvergence` > 10 min (`--convergence-timeout`) ⇒
-   `Failed` state, warning event, stop requeueing. Because nothing has been deleted yet,
-   the system is degraded-but-running and a human can take over via the runbook.
+6. **Timeouts:** stuck in `AwaitingConvergence` > 10 min (`--convergence-timeout`), or
+   blocked by the health gate > 10 min (`--gate-timeout`), ⇒ `Failed` state, warning
+   event, stop requeueing. Because nothing has been deleted yet, the system is
+   degraded-but-running and a human can take over via the runbook. The timeout anchors
+   live in the status annotation with an in-memory fallback, so the bound holds even if
+   annotation writes fail.
 7. **Dry-run:** `--dry-run` flag logs every mutation it *would* make (including the delete)
    and writes status state `DryRun`. First deployment on s4s2 runs this way.
 8. **Emergency opt-out:** `sts-reconciler.sentry.io/skip=true` annotation halts the

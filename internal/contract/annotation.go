@@ -38,6 +38,10 @@ const SupportedVersion = 1
 type State string
 
 const (
+	// StateBlocked: the health gate is refusing to act (e.g. no ready
+	// replicas). The controller retries until the gate clears or the gate
+	// timeout latches Failed.
+	StateBlocked State = "Blocked"
 	// StatePatching: PVC specs are being patched toward the desired spec.
 	StatePatching State = "Patching"
 	// StateAwaitingConvergence: PVC specs match; waiting for PVC status to

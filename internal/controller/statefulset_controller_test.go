@@ -589,6 +589,85 @@ func TestShrinkRejectedEvenWithoutPVCs(t *testing.T) {
 	}
 }
 
+func TestGateTimeoutLatchesFailed(t *testing.T) {
+	desired := desiredJSON(t, map[string]map[string]string{"sqlite": {"storage": "200Gi"}})
+	sts := healthySTS(map[string]string{contract.DesiredSpecAnnotation: desired})
+	sts.Status.ReadyReplicas = 0
+	f := newFixture(t, sts, boundPVC("sqlite-broker-0", "fast", "100Gi", "100Gi"), expandableSC("fast"))
+	f.r.GateTimeout = 50 * time.Millisecond
+
+	f.reconcile()
+	if st := f.status(); st == nil || st.State != contract.StateBlocked {
+		t.Fatalf("status = %+v, want Blocked", st)
+	}
+	time.Sleep(60 * time.Millisecond)
+	f.reconcile()
+	st := f.status()
+	if st == nil || st.State != contract.StateFailed {
+		t.Fatalf("status = %+v, want Failed after gate timeout", st)
+	}
+	if !strings.Contains(st.Reason, ReasonHealthGateTimeout) {
+		t.Fatalf("reason = %q", st.Reason)
+	}
+	// Nothing was mutated and the StatefulSet survives.
+	if f.stsGone() {
+		t.Fatal("gate timeout must not delete anything")
+	}
+	if got := f.getPVC("sqlite-broker-0").Spec.Resources.Requests[corev1.ResourceStorage]; got.String() != "100Gi" {
+		t.Fatal("gate timeout must not patch anything")
+	}
+}
+
+func TestGateRecoveryProceedsWithPatch(t *testing.T) {
+	desired := desiredJSON(t, map[string]map[string]string{"sqlite": {"storage": "200Gi"}})
+	sts := healthySTS(map[string]string{contract.DesiredSpecAnnotation: desired})
+	sts.Status.ReadyReplicas = 0
+	f := newFixture(t, sts, boundPVC("sqlite-broker-0", "fast", "100Gi", "100Gi"), expandableSC("fast"))
+
+	f.reconcile()
+	if st := f.status(); st == nil || st.State != contract.StateBlocked {
+		t.Fatalf("status = %+v, want Blocked", st)
+	}
+
+	// Pods recover before the gate timeout.
+	cur := f.getSTS()
+	cur.Status.ReadyReplicas = 2
+	if err := f.client.Status().Update(context.Background(), cur); err != nil {
+		t.Fatal(err)
+	}
+	f.reconcile()
+	if got := f.getPVC("sqlite-broker-0").Spec.Resources.Requests[corev1.ResourceStorage]; got.String() != "200Gi" {
+		t.Fatal("patching should proceed once the gate clears")
+	}
+	if st := f.status(); st == nil || st.State != contract.StatePatching {
+		t.Fatalf("status = %+v, want Patching", st)
+	}
+}
+
+func TestDeleteGateTimeoutLatchesFailed(t *testing.T) {
+	// PVCs already converged; only the template drifts. Pods go unhealthy
+	// before the orphan-delete: the gate must block, then latch Failed.
+	desired := desiredJSON(t, map[string]map[string]string{"sqlite": {"storage": "200Gi"}})
+	sts := healthySTS(map[string]string{contract.DesiredSpecAnnotation: desired})
+	sts.Status.ReadyReplicas = 0
+	pvc := boundPVC("sqlite-broker-0", "fast", "200Gi", "200Gi")
+	f := newFixture(t, sts, pvc, expandableSC("fast"))
+	f.r.GateTimeout = 50 * time.Millisecond
+
+	f.reconcile()
+	if st := f.status(); st == nil || st.State != contract.StateBlocked {
+		t.Fatalf("status = %+v, want Blocked", st)
+	}
+	time.Sleep(60 * time.Millisecond)
+	f.reconcile()
+	if st := f.status(); st == nil || st.State != contract.StateFailed {
+		t.Fatalf("status = %+v, want Failed", st)
+	}
+	if f.stsGone() {
+		t.Fatal("StatefulSet must survive a blocked delete")
+	}
+}
+
 func TestMapPVCToStatefulSet(t *testing.T) {
 	desired := desiredJSON(t, map[string]map[string]string{"sqlite": {"storage": "200Gi"}})
 	f := newFixture(t, healthySTS(map[string]string{contract.DesiredSpecAnnotation: desired}))
