@@ -289,7 +289,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		// PVCs converged; only the StatefulSet's own volumeClaimTemplates
 		// still disagree. Orphan-delete so it can be recreated with matching
 		// templates.
-		return r.deletePhase(ctx, sts, desired, pvcs, a, status, specHash)
+		return r.deletePhase(ctx, sts, desired, a, status, specHash)
 	}
 }
 
@@ -419,7 +419,7 @@ func (r *Reconciler) convergencePhase(ctx context.Context, sts *appsv1.StatefulS
 // the manifest is snapshotted to a ConfigMap first, so the delete's watch
 // event (or a restarted controller finding the snapshot) can recreate the
 // StatefulSet without waiting for a deploy.
-func (r *Reconciler) deletePhase(ctx context.Context, sts *appsv1.StatefulSet, desired *contract.DesiredSpec, pvcs []drift.ClaimPVC, a *drift.Assessment, status *contract.Status, specHash string) (ctrl.Result, error) {
+func (r *Reconciler) deletePhase(ctx context.Context, sts *appsv1.StatefulSet, desired *contract.DesiredSpec, a *drift.Assessment, status *contract.Status, specHash string) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
 
 	if reason := healthGate(sts); reason != "" {
@@ -437,14 +437,23 @@ func (r *Reconciler) deletePhase(ctx context.Context, sts *appsv1.StatefulSet, d
 	}
 
 	if r.SelfRecreate {
-		if len(pvcs) == 0 {
+		// Anchor on the PVCs of EVERY volumeClaimTemplate, not just the
+		// claims in the desired spec: snapshotAnchored verifies the full
+		// template set (it cannot know which claims the stripped annotation
+		// named), so anchoring a subset would get the snapshot rejected and
+		// strand the workload after the delete.
+		anchorable, err := r.listPVCsByClaims(ctx, sts.Namespace, sts.Name, templateClaimNames(sts))
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+		if len(anchorable) == 0 {
 			// With no PVCs there is nothing to anchor a snapshot to (see
 			// AnchorAnnotation) — and nothing was patched either, so the next
 			// deploy re-applying the manifest loses nothing. Fall back to
 			// deploy-mode semantics for this StatefulSet.
 			r.Recorder.Event(sts, corev1.EventTypeWarning, ReasonSnapshotSkipped,
 				"no PVCs exist to anchor a recreation snapshot; recreation is left to the next deploy")
-		} else if err := r.writeSnapshot(ctx, sts, desired, pvcs); err != nil {
+		} else if err := r.writeSnapshot(ctx, sts, desired, anchorable); err != nil {
 			return ctrl.Result{}, fmt.Errorf("writing recreation snapshot: %w", err)
 		}
 	}

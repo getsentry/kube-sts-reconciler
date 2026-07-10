@@ -814,6 +814,59 @@ func TestSelfRecreateRecoversFromOrphanedSnapshot(t *testing.T) {
 	}
 }
 
+func TestSelfRecreateWithPartialClaimSpec(t *testing.T) {
+	// Two volumeClaimTemplates, but the desired spec touches only "sqlite".
+	// The snapshot must anchor the "logs" PVCs too, or its own verification
+	// would reject it after the orphan-delete and strand the workload.
+	desired := desiredJSON(t, map[string]map[string]string{"sqlite": {"storage": "200Gi"}})
+	sts := healthySTS(map[string]string{contract.DesiredSpecAnnotation: desired})
+	sts.Spec.VolumeClaimTemplates = append(sts.Spec.VolumeClaimTemplates, corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{Name: "logs"},
+		Spec: corev1.PersistentVolumeClaimSpec{
+			AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+			Resources: corev1.VolumeResourceRequirements{
+				Requests: corev1.ResourceList{corev1.ResourceStorage: resource.MustParse("10Gi")},
+			},
+		},
+	})
+	f := newFixture(t, sts,
+		boundPVC("sqlite-broker-0", "fast", "100Gi", "100Gi"),
+		boundPVC("sqlite-broker-1", "fast", "100Gi", "100Gi"),
+		boundPVC("logs-broker-0", "fast", "10Gi", "10Gi"),
+		boundPVC("logs-broker-1", "fast", "10Gi", "10Gi"),
+		expandableSC("fast"),
+	)
+	f.r.SelfRecreate = true
+
+	f.reconcile() // patch sqlite PVCs
+	f.reconcile() // AwaitingConvergence
+	f.simulateCSI("sqlite-broker-0")
+	f.simulateCSI("sqlite-broker-1")
+	f.reconcile() // snapshot (anchoring ALL claim PVCs) + orphan-delete
+	if !f.stsGone() {
+		t.Fatal("StatefulSet should be deleted")
+	}
+	for _, name := range []string{"sqlite-broker-0", "logs-broker-0", "logs-broker-1"} {
+		if _, has := f.getPVC(name).Annotations[recreate.AnchorAnnotation]; !has {
+			t.Fatalf("%s must carry the snapshot anchor", name)
+		}
+	}
+
+	f.reconcile() // recreate from snapshot; must not be rejected
+	sts = f.getSTS()
+	if got := sts.Spec.VolumeClaimTemplates[0].Spec.Resources.Requests[corev1.ResourceStorage]; got.String() != "200Gi" {
+		t.Fatalf("recreated sqlite template = %s", got.String())
+	}
+	if got := sts.Spec.VolumeClaimTemplates[1].Spec.Resources.Requests[corev1.ResourceStorage]; got.String() != "10Gi" {
+		t.Fatalf("untouched logs template = %s", got.String())
+	}
+	for _, name := range []string{"sqlite-broker-0", "logs-broker-0"} {
+		if _, has := f.getPVC(name).Annotations[recreate.AnchorAnnotation]; has {
+			t.Fatalf("%s anchor should be cleared after recreation", name)
+		}
+	}
+}
+
 func TestSnapshotAnchoredByHighOrdinalPVCOnly(t *testing.T) {
 	// Only a PVC beyond replicas-1 (retained from a scale-down) survives and
 	// anchors the snapshot. Recovery must still work: verification matches
