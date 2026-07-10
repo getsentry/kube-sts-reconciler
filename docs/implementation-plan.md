@@ -198,7 +198,9 @@ every existing claim PVC — to carry the matching anchor, and the manifest's id
 must match the snapshot's key. PVCs survive the delete window by design and forging the
 anchor requires PVC patch rights, so ConfigMap access alone cannot cross the boundary.
 Rejected snapshots are left in place (as evidence) with a `SnapshotRejected` warning
-event on the ConfigMap.
+event on the ConfigMap. A StatefulSet with no PVCs at all cannot be anchored, so self
+mode refuses to orphan-delete it (blocked, then `Failed` after the gate timeout) rather
+than delete something it could never recreate.
 
 Recreate race (`deploy` mode): if sentry-kube re-applies while the controller is still in
 `Patching`, the apply necessarily carries the *old* `volumeClaimTemplates` (the new ones are

@@ -863,6 +863,41 @@ func TestSelfRecreateRecoversFromOrphanedSnapshot(t *testing.T) {
 	}
 }
 
+func TestSelfRecreateRefusesDeleteWithoutAnchorablePVCs(t *testing.T) {
+	// Scaled-to-zero StatefulSet: template drift, no PVCs at all. In self
+	// mode the delete must be refused — an unanchorable snapshot means the
+	// StatefulSet could never be recreated. The gate timeout bounds the wait.
+	desired := desiredJSON(t, map[string]map[string]string{"sqlite": {"storage": "200Gi"}})
+	sts := healthySTS(map[string]string{contract.DesiredSpecAnnotation: desired})
+	zero := int32(0)
+	sts.Spec.Replicas = &zero
+	sts.Status.Replicas = 0
+	sts.Status.ReadyReplicas = 0
+	f := newFixture(t, sts) // no PVCs
+	f.r.SelfRecreate = true
+	f.r.GateTimeout = 50 * time.Millisecond
+
+	res := f.reconcile()
+	if f.stsGone() {
+		t.Fatal("self mode must not delete a StatefulSet it cannot recreate")
+	}
+	if res.RequeueAfter == 0 {
+		t.Fatal("expected a requeue while blocked")
+	}
+	if st := f.status(); st == nil || st.State != contract.StateBlocked {
+		t.Fatalf("status = %+v, want Blocked", st)
+	}
+
+	time.Sleep(60 * time.Millisecond)
+	f.reconcile()
+	if st := f.status(); st == nil || st.State != contract.StateFailed {
+		t.Fatalf("status = %+v, want Failed after gate timeout", st)
+	}
+	if f.stsGone() {
+		t.Fatal("StatefulSet must survive")
+	}
+}
+
 func TestSelfRecreateWithPartialClaimSpec(t *testing.T) {
 	// Two volumeClaimTemplates, but the desired spec touches only "sqlite".
 	// The snapshot must anchor the "logs" PVCs too, or its own verification

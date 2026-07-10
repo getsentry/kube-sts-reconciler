@@ -55,7 +55,6 @@ const (
 	ReasonModifyInfeasible     = "ModifyVolumeInfeasible"
 	ReasonOrphanDeleted        = "OrphanDeleted"
 	ReasonRecreated            = "Recreated"
-	ReasonSnapshotSkipped      = "SnapshotSkipped"
 	ReasonSnapshotRejected     = "SnapshotRejected"
 	ReasonReconcileComplete    = "ReconcileComplete"
 	ReasonDryRun               = "DryRun"
@@ -455,12 +454,16 @@ func (r *Reconciler) deletePhase(ctx context.Context, sts *appsv1.StatefulSet, d
 		}
 		if len(anchorable) == 0 {
 			// With no PVCs there is nothing to anchor a snapshot to (see
-			// AnchorAnnotation) — and nothing was patched either, so the next
-			// deploy re-applying the manifest loses nothing. Fall back to
-			// deploy-mode semantics for this StatefulSet.
-			r.Recorder.Event(sts, corev1.EventTypeWarning, ReasonSnapshotSkipped,
-				"no PVCs exist to anchor a recreation snapshot; recreation is left to the next deploy")
-		} else if err := r.writeSnapshot(ctx, sts, desired, anchorable); err != nil {
+			// AnchorAnnotation), which means the deleted StatefulSet could
+			// never be recreated from it — and in self mode no deploy is
+			// coming to re-apply it. Refuse the delete: if PVCs appear (e.g.
+			// a scale-up), the normal flow patches and anchors them and the
+			// delete proceeds; otherwise the gate timeout latches Failed.
+			return r.gateBlocked(ctx, sts, status, specHash,
+				"refusing to orphan-delete in self-recreate mode: no PVCs exist to anchor the recreation snapshot, so the StatefulSet could not be recreated (scale up, re-apply manually, or remove the annotation)",
+				a.PVCStates)
+		}
+		if err := r.writeSnapshot(ctx, sts, desired, anchorable); err != nil {
 			return ctrl.Result{}, fmt.Errorf("writing recreation snapshot: %w", err)
 		}
 	}
