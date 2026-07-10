@@ -52,7 +52,7 @@ spec:
             - --dry-run
             {{- end }}
             {{- range .Values.controller.extraArgs }}
-            - {{ . }}
+            - {{ . | quote }}
             {{- end }}
           ports:
             - name: metrics
