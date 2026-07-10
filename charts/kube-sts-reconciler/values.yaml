@@ -1,0 +1,60 @@
+image:
+  repository: ghcr.io/getsentry/kube-sts-reconciler
+  # Defaults to the chart appVersion when empty.
+  tag: ""
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+
+# Single replica with leader election: rolling updates cannot double-reconcile.
+replicaCount: 1
+
+controller:
+  # Only StatefulSets matching this selector are reconciled. Empty selects everything.
+  labelSelector: "service=taskbroker"
+  # Who recreates the StatefulSet after the orphan-delete:
+  #   deploy - the next deploy/apply re-applies it (controller stays stateless)
+  #   self   - the controller snapshots the manifest and recreates it itself
+  # NOTE: "self" grants the controller extra RBAC (create statefulsets, write configmaps).
+  recreateMode: deploy
+  # Log intended actions without mutating anything. Recommended for the first
+  # rollout in a new cluster.
+  dryRun: false
+  convergenceTimeout: 10m
+  gateTimeout: 10m
+  leaderElection: true
+  # Extra args appended verbatim to the manager (e.g. ["--zap-log-level=debug"]).
+  extraArgs: []
+
+serviceAccount:
+  create: true
+  # Defaults to the release fullname when empty.
+  name: ""
+  annotations: {}
+
+rbac:
+  # Set false to manage roles out-of-band; the chart then only references the
+  # ServiceAccount.
+  create: true
+
+metrics:
+  port: 8080
+  service:
+    enabled: true
+    annotations: {}
+
+healthProbePort: 8081
+
+resources:
+  requests:
+    cpu: 50m
+    memory: 64Mi
+  limits:
+    memory: 256Mi
+
+podAnnotations: {}
+podLabels: {}
+nodeSelector: {}
+tolerations: []
+affinity: {}
+priorityClassName: ""

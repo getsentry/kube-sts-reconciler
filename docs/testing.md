@@ -80,6 +80,16 @@ The test then:
 Safety: the test inspects the current kubeconfig context and refuses to run unless it
 starts with `kind-`. It cannot be pointed at a real cluster by accident.
 
+### Deployed variant
+
+`just e2e-deployed` runs the same test against the controller **deployed the way
+production would run it**: it builds the distroless image, `kind load`s it, installs
+the Helm chart (`charts/kube-sts-reconciler`) into `sts-reconciler-system`, waits for
+rollout, and runs the suite with `E2E_DEPLOYED=1` so no in-process manager starts.
+This is the only layer that exercises the real image, the chart's RBAC, and the
+health probes — an RBAC mistake in the chart fails here instead of during a cluster
+rollout.
+
 ### Manual poking
 
 The e2e test cleans up after itself, so a fresh kind cluster has nothing to poke.

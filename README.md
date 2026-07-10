@@ -58,6 +58,25 @@ go run ./cmd \
   the controller create arbitrary StatefulSets. Requires extra RBAC (`create` on
   statefulsets, read/write on configmaps).
 
+## Deploying
+
+The controller ships as a distroless container image and a Helm chart (both published
+to GHCR on version tags):
+
+```sh
+helm install ksr oci://ghcr.io/getsentry/charts/kube-sts-reconciler \
+  --namespace sts-reconciler-system --create-namespace \
+  --set controller.labelSelector="service=taskbroker" \
+  --set controller.recreateMode=deploy \
+  --set controller.dryRun=true          # recommended for the first rollout
+```
+
+The chart encodes the least-privilege RBAC split: `controller.recreateMode=self` is the
+only thing that grants `create` on StatefulSets and write access to ConfigMaps. See
+[charts/kube-sts-reconciler/values.yaml](charts/kube-sts-reconciler/values.yaml) for
+all knobs (timeouts, metrics, resources, scheduling). Environments that don't consume
+Helm directly can render plain manifests with `helm template`.
+
 ## Development & testing
 
 ```sh

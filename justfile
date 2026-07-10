@@ -49,6 +49,42 @@ test-e2e:
 # Full e2e: create the kind cluster, then run the e2e tests against it
 e2e: kind-up test-e2e
 
+# --- Packaged deployment (image + Helm chart) --------------------------------
+
+image_name := env_var_or_default("IMAGE_NAME", "kube-sts-reconciler")
+image_tag := env_var_or_default("IMAGE_TAG", "dev")
+
+# Build the controller container image (distroless)
+build-image:
+    docker build -t {{image_name}}:{{image_tag}} .
+
+# Load the locally built image into the kind cluster
+kind-load: build-image
+    kind load docker-image {{image_name}}:{{image_tag}} --name {{kind_cluster}}
+
+# Lint the Helm chart and render both recreate modes
+helm-lint:
+    helm lint charts/kube-sts-reconciler
+    helm template ksr charts/kube-sts-reconciler > /dev/null
+    helm template ksr charts/kube-sts-reconciler --set controller.recreateMode=self > /dev/null
+
+# Install the chart into the kind cluster using the locally built image
+deploy-kind: kind-load
+    kubectl config use-context kind-{{kind_cluster}}
+    helm upgrade --install ksr charts/kube-sts-reconciler \
+        --namespace sts-reconciler-system --create-namespace \
+        --set image.repository={{image_name}} --set image.tag={{image_tag}} \
+        --set image.pullPolicy=Never
+    kubectl -n sts-reconciler-system rollout status deploy/ksr-kube-sts-reconciler --timeout=120s
+
+# E2E against the helm-deployed in-cluster controller (real image, RBAC, probes)
+test-e2e-deployed:
+    kubectl config use-context kind-{{kind_cluster}}
+    E2E_DEPLOYED=1 go test -tags e2e -v -timeout 20m ./test/e2e/...
+
+# Full deployed e2e: cluster + image + chart + tests
+e2e-deployed: kind-up deploy-kind test-e2e-deployed
+
 # Run the controller locally against the current kubeconfig in dry-run mode
 run-dry-run:
     go run ./cmd --dry-run --label-selector= --metrics-bind-address=0 --health-probe-bind-address=0

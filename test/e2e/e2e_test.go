@@ -15,6 +15,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -225,7 +226,15 @@ func TestEndToEnd(t *testing.T) {
 		_ = c.Delete(cleanupCtx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})
 	})
 
-	startManager(t, ctx, scheme)
+	if os.Getenv("E2E_DEPLOYED") == "1" {
+		// The controller is already running IN the cluster (helm-installed
+		// from the chart, image built and kind-loaded by `just e2e-deployed`).
+		// This exercises the real image, RBAC, and probes instead of an
+		// in-process manager.
+		t.Log("E2E_DEPLOYED=1: using the in-cluster controller")
+	} else {
+		startManager(t, ctx, scheme)
+	}
 	sim := &csisim.Simulator{Client: c, Namespace: ns, Latency: 2 * time.Second}
 	go sim.Run(ctx)
 
