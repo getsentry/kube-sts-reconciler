@@ -1200,14 +1200,28 @@ func TestWaveGroupsAllClaimsOfAnOrdinal(t *testing.T) {
 }
 
 func TestPartialWaveCompletesBeforeNextWave(t *testing.T) {
-	// Ordinal 0 is already converging (a partially applied wave of 2), and
-	// ordinals 1-3 are still drifted. The wave must complete itself — patch
-	// ordinal 1 — without starting ordinals 2-3, so a replica's volumes are
-	// never left split across reconciles behind converging siblings.
+	// Models a crash mid-wave: the status annotation records wave {0,1}
+	// (written before any patch), ordinal 0 was patched and is converging,
+	// ordinal 1 never got its patch. The recorded wave must complete itself
+	// — patch ordinal 1 — without starting ordinals 2-3.
 	spec := `{"version":1,"batchSize":2,"claims":{"sqlite":{"storage":"200Gi"}}}`
+	recorded := &contract.Status{
+		Version:          contract.SupportedVersion,
+		State:            contract.StatePatching,
+		ObservedSpecHash: contract.HashValue(spec),
+		WaveOrdinals:     []int{0, 1},
+		LastTransition:   time.Now().UTC(),
+	}
+	encoded, err := recorded.Encode()
+	if err != nil {
+		t.Fatal(err)
+	}
 	inflight := boundPVC("sqlite-broker-0", "fast", "200Gi", "100Gi") // spec patched, status lagging
 	f := newFixture(t,
-		healthySTS(map[string]string{contract.DesiredSpecAnnotation: spec}),
+		healthySTS(map[string]string{
+			contract.DesiredSpecAnnotation: spec,
+			contract.StatusAnnotation:      encoded,
+		}),
 		inflight,
 		boundPVC("sqlite-broker-1", "fast", "100Gi", "100Gi"),
 		boundPVC("sqlite-broker-2", "fast", "100Gi", "100Gi"),
@@ -1217,11 +1231,45 @@ func TestPartialWaveCompletesBeforeNextWave(t *testing.T) {
 
 	f.reconcile()
 	if got := f.getPVC("sqlite-broker-1").Spec.Resources.Requests[corev1.ResourceStorage]; got.String() != "200Gi" {
-		t.Fatal("ordinal 1 belongs to the in-flight wave and must be patched now")
+		t.Fatal("ordinal 1 belongs to the recorded wave and must be patched now")
 	}
 	for _, name := range []string{"sqlite-broker-2", "sqlite-broker-3"} {
 		if got := f.getPVC(name).Spec.Resources.Requests[corev1.ResourceStorage]; got.String() != "100Gi" {
 			t.Fatalf("%s belongs to the next wave and must wait", name)
+		}
+	}
+}
+
+func TestNextWaveWaitsForWholeWave(t *testing.T) {
+	// Bugbot scenario: wave {0,1} in flight, ordinal 0 converges first. The
+	// next wave must NOT slide in while ordinal 1 is still converging.
+	spec := `{"version":1,"batchSize":2,"claims":{"sqlite":{"storage":"200Gi"}}}`
+	f := newFixture(t,
+		healthySTS(map[string]string{contract.DesiredSpecAnnotation: spec}),
+		boundPVC("sqlite-broker-0", "fast", "100Gi", "100Gi"),
+		boundPVC("sqlite-broker-1", "fast", "100Gi", "100Gi"),
+		boundPVC("sqlite-broker-2", "fast", "100Gi", "100Gi"),
+		boundPVC("sqlite-broker-3", "fast", "100Gi", "100Gi"),
+		expandableSC("fast"),
+	)
+
+	f.reconcile() // wave {0,1} patched and recorded
+	f.simulateCSI("sqlite-broker-0")
+	f.reconcile() // ordinal 1 still converging: no new patches
+	for _, name := range []string{"sqlite-broker-2", "sqlite-broker-3"} {
+		if got := f.getPVC(name).Spec.Resources.Requests[corev1.ResourceStorage]; got.String() != "100Gi" {
+			t.Fatalf("%s must wait until the WHOLE wave has converged", name)
+		}
+	}
+	if st := f.status(); st == nil || len(st.WaveOrdinals) != 2 {
+		t.Fatalf("recorded wave must be carried through convergence, got %+v", st)
+	}
+
+	f.simulateCSI("sqlite-broker-1")
+	f.reconcile() // wave done -> wave {2,3}
+	for _, name := range []string{"sqlite-broker-2", "sqlite-broker-3"} {
+		if got := f.getPVC(name).Spec.Resources.Requests[corev1.ResourceStorage]; got.String() != "200Gi" {
+			t.Fatalf("%s should be patched once the previous wave fully converged", name)
 		}
 	}
 }

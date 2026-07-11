@@ -91,8 +91,13 @@ type Status struct {
 	State            State             `json:"state"`
 	ObservedSpecHash string            `json:"observedSpecHash"`
 	PVCs             map[string]string `json:"pvcs,omitempty"`
-	Reason           string            `json:"reason,omitempty"`
-	LastTransition   time.Time         `json:"lastTransition"`
+	// WaveOrdinals records which ordinals belong to the rollout wave
+	// currently in flight (batchSize > 0 only). Persisted before any PVC in
+	// the wave is patched, so wave membership survives crashes and partial
+	// patches without in-memory state.
+	WaveOrdinals   []int     `json:"waveOrdinals,omitempty"`
+	Reason         string    `json:"reason,omitempty"`
+	LastTransition time.Time `json:"lastTransition"`
 }
 
 // ParseDesiredSpec parses and validates the desired-pvc-spec annotation value.

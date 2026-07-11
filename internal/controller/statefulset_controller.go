@@ -296,50 +296,76 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		// Something is drifted or converging. Patch whatever belongs to the
 		// current wave; when the wave has nothing left to patch, wait for it
 		// to converge before the next wave starts.
-		wave := currentWave(a, desired.BatchSize)
+		wave, waveOrdinals := currentWave(a, status, specHash, desired.BatchSize)
 		if len(wave) == 0 {
 			return r.convergencePhase(ctx, sts, a, status, specHash)
 		}
-		return r.patchPhase(ctx, sts, desired, a, wave, status, specHash)
+		return r.patchPhase(ctx, sts, desired, a, wave, waveOrdinals, status, specHash)
 	}
 }
 
-// currentWave reconstructs, statelessly, which PVCs may be patched right now.
-// The wave is the `replicasPerWave` lowest ordinals among everything drifted
-// OR still converging — so a partially applied wave always completes itself
-// (a replica's volumes are never left split across reconciles), while the
-// next wave cannot start until the current one has fully converged. Zero
-// means everything is one wave.
-func currentWave(a *drift.Assessment, replicasPerWave int) []drift.Patch {
+// currentWave decides which PVCs may be patched right now, and which ordinals
+// make up the wave they belong to.
+//
+// Wave membership is read from the status annotation, where patchPhase
+// records it BEFORE patching anything — so a partially applied wave (crash or
+// patch error midway) always completes itself, and a wave whose members have
+// merely converged one-by-one never lets the next wave start early. Only
+// when the recorded wave is fully done (none of its ordinals drifted or
+// converging) does a new wave open: the `replicasPerWave` lowest drifted
+// ordinals. In-flight PVCs the controller has no record of starting (e.g. an
+// external patch, or a mid-flight controller upgrade) are conservatively
+// waited out before a new wave opens. Zero means everything is one wave.
+func currentWave(a *drift.Assessment, status *contract.Status, specHash string, replicasPerWave int) ([]drift.Patch, []int) {
 	if replicasPerWave <= 0 {
-		return a.Patches
+		return a.Patches, nil
 	}
-	ordinals := map[int]bool{}
-	for o := range a.WaitingOrdinals {
-		ordinals[o] = true
-	}
-	for _, p := range a.Patches {
-		ordinals[p.Ordinal] = true
-	}
-	sorted := make([]int, 0, len(ordinals))
-	for o := range ordinals {
-		sorted = append(sorted, o)
-	}
-	sort.Ints(sorted)
-	if len(sorted) > replicasPerWave {
-		sorted = sorted[:replicasPerWave]
-	}
-	wave := map[int]bool{}
-	for _, o := range sorted {
-		wave[o] = true
-	}
-	var out []drift.Patch
-	for _, p := range a.Patches {
-		if wave[p.Ordinal] {
-			out = append(out, p)
+
+	// Resume the recorded wave if any of its ordinals is still in progress.
+	if status != nil && status.ObservedSpecHash == specHash && len(status.WaveOrdinals) > 0 {
+		recorded := map[int]bool{}
+		for _, o := range status.WaveOrdinals {
+			recorded[o] = true
+		}
+		active := false
+		for o := range a.WaitingOrdinals {
+			if recorded[o] {
+				active = true
+			}
+		}
+		var out []drift.Patch
+		for _, p := range a.Patches {
+			if recorded[p.Ordinal] {
+				out = append(out, p)
+				active = true
+			}
+		}
+		if active {
+			return out, status.WaveOrdinals
 		}
 	}
-	return out
+
+	// No wave of ours is in flight. If something is converging anyway, it is
+	// not ours to race: wait before opening a new wave.
+	if len(a.WaitingOrdinals) > 0 {
+		return nil, nil
+	}
+
+	// Open the next wave: the lowest replicasPerWave drifted ordinals.
+	seen := map[int]bool{}
+	var ordinals []int
+	var out []drift.Patch
+	for _, p := range a.Patches { // sorted by ordinal
+		if !seen[p.Ordinal] {
+			if len(seen) == replicasPerWave {
+				break
+			}
+			seen[p.Ordinal] = true
+			ordinals = append(ordinals, p.Ordinal)
+		}
+		out = append(out, p)
+	}
+	return out, ordinals
 }
 
 // gateBlocked handles a closed health gate: warn, record the Blocked state,
@@ -374,7 +400,7 @@ func (r *Reconciler) gateBlocked(ctx context.Context, sts *appsv1.StatefulSet, s
 // patchPhase validates prerequisites and patches the given wave of drifted
 // PVC specs — everything at once by default, or batchSize ordinals per wave
 // when the desired spec asks for a rolling change.
-func (r *Reconciler) patchPhase(ctx context.Context, sts *appsv1.StatefulSet, desired *contract.DesiredSpec, a *drift.Assessment, wave []drift.Patch, status *contract.Status, specHash string) (ctrl.Result, error) {
+func (r *Reconciler) patchPhase(ctx context.Context, sts *appsv1.StatefulSet, desired *contract.DesiredSpec, a *drift.Assessment, wave []drift.Patch, waveOrdinals []int, status *contract.Status, specHash string) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
 
 	if reason := healthGate(sts); reason != "" {
@@ -410,11 +436,12 @@ func (r *Reconciler) patchPhase(ctx context.Context, sts *appsv1.StatefulSet, de
 		return ctrl.Result{}, nil
 	}
 
-	// Reset the convergence-timeout clock BEFORE patching anything: clear the
-	// previous wave's in-memory anchor and persist the Patching state. If
-	// either fails, no PVC has been touched and the retry starts clean — the
-	// persisted status can never say AwaitingConvergence (with the previous
-	// wave's timestamp) while this wave's volumes are already converging.
+	// Persist wave membership and reset the convergence-timeout clock BEFORE
+	// patching anything: clear the previous wave's in-memory anchor and write
+	// the Patching state with this wave's ordinals. If either fails, no PVC
+	// has been touched and the retry starts clean — and once patches begin,
+	// the recorded wave lets a crashed or partially applied wave complete
+	// itself without letting the next wave start early.
 	r.clearAnchor(sts.Namespace, sts.Name)
 	reason := ""
 	if remaining := len(a.Patches) - len(wave); remaining > 0 {
@@ -425,6 +452,7 @@ func (r *Reconciler) patchPhase(ctx context.Context, sts *appsv1.StatefulSet, de
 		State:            contract.StatePatching,
 		ObservedSpecHash: specHash,
 		PVCs:             a.PVCStates,
+		WaveOrdinals:     waveOrdinals,
 		Reason:           reason,
 		LastTransition:   time.Now().UTC(),
 	}); err != nil {
@@ -469,11 +497,18 @@ func (r *Reconciler) convergencePhase(ctx context.Context, sts *appsv1.StatefulS
 			"PVC specs match desired spec; waiting for the CSI driver to converge PVC status")
 	}
 
+	// Carry the recorded wave forward: losing it here would let the next
+	// wave start before this one finished converging.
+	var waveOrdinals []int
+	if status != nil && status.ObservedSpecHash == specHash {
+		waveOrdinals = status.WaveOrdinals
+	}
 	if err := r.writeStatus(ctx, sts, &contract.Status{
 		Version:          contract.SupportedVersion,
 		State:            contract.StateAwaitingConvergence,
 		ObservedSpecHash: specHash,
 		PVCs:             a.PVCStates,
+		WaveOrdinals:     waveOrdinals,
 		LastTransition:   transition,
 	}); err != nil {
 		return ctrl.Result{}, err
@@ -969,6 +1004,7 @@ func (r *Reconciler) writeStatus(ctx context.Context, sts *appsv1.StatefulSet, n
 		cur.State == next.State &&
 		cur.ObservedSpecHash == next.ObservedSpecHash &&
 		cur.Reason == next.Reason &&
+		intsEqual(cur.WaveOrdinals, next.WaveOrdinals) &&
 		mapsEqual(cur.PVCs, next.PVCs) {
 		return nil
 	}
@@ -1028,6 +1064,18 @@ func waitingSummary(a *drift.Assessment) string {
 		parts = append(parts, fmt.Sprintf("%s: %s", name, a.Waiting[name]))
 	}
 	return strings.Join(parts, "; ")
+}
+
+func intsEqual(a, b []int) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func mapsEqual(a, b map[string]string) bool {
