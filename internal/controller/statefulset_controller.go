@@ -397,22 +397,16 @@ func (r *Reconciler) patchPhase(ctx context.Context, sts *appsv1.StatefulSet, de
 	// rule in Reconcile keeps further waves from starting until this one has
 	// converged.
 	wave := waveOf(a.Patches, desired.BatchSize)
-	for _, p := range wave {
-		if err := r.applyPVCPatch(ctx, p); err != nil {
-			return ctrl.Result{}, fmt.Errorf("patching PVC %s: %w", p.PVC.Name, err)
-		}
-		msg := fmt.Sprintf("patched PVC %s (%s)", p.PVC.Name, describePatch(p))
-		log.Info(msg)
-		r.Recorder.Event(sts, corev1.EventTypeNormal, ReasonPVCPatched, msg)
-	}
 
-	// Each wave gets a fresh convergence-timeout clock: drop the in-memory
-	// anchor left by the previous wave's AwaitingConvergence.
+	// Reset the convergence-timeout clock BEFORE patching anything: clear the
+	// previous wave's in-memory anchor and persist the Patching state. If
+	// either fails, no PVC has been touched and the retry starts clean — the
+	// persisted status can never say AwaitingConvergence (with the previous
+	// wave's timestamp) while this wave's volumes are already converging.
 	r.clearAnchor(sts.Namespace, sts.Name)
-
 	reason := ""
 	if remaining := len(a.Patches) - len(wave); remaining > 0 {
-		reason = fmt.Sprintf("wave of %d PVC(s) patched; %d PVC(s) queued for later waves", len(wave), remaining)
+		reason = fmt.Sprintf("wave of %d PVC(s) being patched; %d PVC(s) queued for later waves", len(wave), remaining)
 	}
 	if err := r.writeStatus(ctx, sts, &contract.Status{
 		Version:          contract.SupportedVersion,
@@ -423,6 +417,15 @@ func (r *Reconciler) patchPhase(ctx context.Context, sts *appsv1.StatefulSet, de
 		LastTransition:   time.Now().UTC(),
 	}); err != nil {
 		return ctrl.Result{}, err
+	}
+
+	for _, p := range wave {
+		if err := r.applyPVCPatch(ctx, p); err != nil {
+			return ctrl.Result{}, fmt.Errorf("patching PVC %s: %w", p.PVC.Name, err)
+		}
+		msg := fmt.Sprintf("patched PVC %s (%s)", p.PVC.Name, describePatch(p))
+		log.Info(msg)
+		r.Recorder.Event(sts, corev1.EventTypeNormal, ReasonPVCPatched, msg)
 	}
 	return ctrl.Result{RequeueAfter: patchRequeue}, nil
 }
