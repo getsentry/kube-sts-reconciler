@@ -48,6 +48,9 @@ type Assessment struct {
 	// Waiting maps PVC name -> human-readable reason for PVCs whose spec
 	// matches but whose status has not yet converged.
 	Waiting map[string]string
+	// WaitingOrdinals is the set of ordinals with a PVC in Waiting, used to
+	// reconstruct the current rollout wave statelessly.
+	WaitingOrdinals map[int]bool
 	// Infeasible maps PVC name -> reason for terminal, non-retryable
 	// failures reported by the CSI driver (e.g. ModifyVolume infeasible).
 	Infeasible map[string]string
@@ -133,9 +136,10 @@ func Validate(desired *contract.DesiredSpec, sts *appsv1.StatefulSet, pvcs []Cla
 // updated template.
 func Assess(desired *contract.DesiredSpec, sts *appsv1.StatefulSet, pvcs []ClaimPVC) *Assessment {
 	a := &Assessment{
-		Waiting:    map[string]string{},
-		Infeasible: map[string]string{},
-		PVCStates:  map[string]string{},
+		Waiting:         map[string]string{},
+		WaitingOrdinals: map[int]bool{},
+		Infeasible:      map[string]string{},
+		PVCStates:       map[string]string{},
 	}
 	for _, cp := range pvcs {
 		want, ok := desired.Claims[cp.Claim]
@@ -209,6 +213,9 @@ func assessPVC(a *Assessment, cp ClaimPVC, want contract.ClaimDesired) {
 
 	if patch.NewVAC != nil || patch.NewStorage != "" {
 		a.Patches = append(a.Patches, patch)
+	}
+	if a.Waiting[pvc.Name] != "" {
+		a.WaitingOrdinals[cp.Ordinal] = true
 	}
 
 	// Precedence: a terminal failure trumps everything, then pending spec

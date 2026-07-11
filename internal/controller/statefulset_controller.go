@@ -287,39 +287,57 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	switch {
 	case a.Done():
 		return r.complete(ctx, sts)
-	case len(a.Waiting) > 0:
-		// Backpressure: never patch more PVCs while any already-patched PVC
-		// is still converging. This is what makes wave-based rollouts work,
-		// and it bounds in-flight volume modifications even without an
-		// explicit batchSize.
-		return r.convergencePhase(ctx, sts, a, status, specHash)
-	case !a.SpecsMatch():
-		return r.patchPhase(ctx, sts, desired, a, status, specHash)
-	default:
+	case a.Converged():
 		// PVCs converged; only the StatefulSet's own volumeClaimTemplates
 		// still disagree. Orphan-delete so it can be recreated with matching
 		// templates.
 		return r.deletePhase(ctx, sts, desired, a, status, specHash)
+	default:
+		// Something is drifted or converging. Patch whatever belongs to the
+		// current wave; when the wave has nothing left to patch, wait for it
+		// to converge before the next wave starts.
+		wave := currentWave(a, desired.BatchSize)
+		if len(wave) == 0 {
+			return r.convergencePhase(ctx, sts, a, status, specHash)
+		}
+		return r.patchPhase(ctx, sts, desired, a, wave, status, specHash)
 	}
 }
 
-// waveOf limits a sorted patch list to the PVCs of the first
-// `replicasPerWave` distinct ordinals, so a pod's volumes always move
-// together within one wave.
-func waveOf(patches []drift.Patch, replicasPerWave int) []drift.Patch {
+// currentWave reconstructs, statelessly, which PVCs may be patched right now.
+// The wave is the `replicasPerWave` lowest ordinals among everything drifted
+// OR still converging — so a partially applied wave always completes itself
+// (a replica's volumes are never left split across reconciles), while the
+// next wave cannot start until the current one has fully converged. Zero
+// means everything is one wave.
+func currentWave(a *drift.Assessment, replicasPerWave int) []drift.Patch {
 	if replicasPerWave <= 0 {
-		return patches
+		return a.Patches
+	}
+	ordinals := map[int]bool{}
+	for o := range a.WaitingOrdinals {
+		ordinals[o] = true
+	}
+	for _, p := range a.Patches {
+		ordinals[p.Ordinal] = true
+	}
+	sorted := make([]int, 0, len(ordinals))
+	for o := range ordinals {
+		sorted = append(sorted, o)
+	}
+	sort.Ints(sorted)
+	if len(sorted) > replicasPerWave {
+		sorted = sorted[:replicasPerWave]
+	}
+	wave := map[int]bool{}
+	for _, o := range sorted {
+		wave[o] = true
 	}
 	var out []drift.Patch
-	seen := map[int]bool{}
-	for _, p := range patches {
-		if !seen[p.Ordinal] {
-			if len(seen) == replicasPerWave {
-				break
-			}
-			seen[p.Ordinal] = true
+	for _, p := range a.Patches {
+		if wave[p.Ordinal] {
+			out = append(out, p)
 		}
-		out = append(out, p)
 	}
 	return out
 }
@@ -353,10 +371,10 @@ func (r *Reconciler) gateBlocked(ctx context.Context, sts *appsv1.StatefulSet, s
 	return ctrl.Result{RequeueAfter: gateRequeue}, nil
 }
 
-// patchPhase validates prerequisites and patches drifted PVC specs — all at
-// once by default, or one wave of batchSize ordinals at a time when the
-// desired spec asks for a rolling change.
-func (r *Reconciler) patchPhase(ctx context.Context, sts *appsv1.StatefulSet, desired *contract.DesiredSpec, a *drift.Assessment, status *contract.Status, specHash string) (ctrl.Result, error) {
+// patchPhase validates prerequisites and patches the given wave of drifted
+// PVC specs — everything at once by default, or batchSize ordinals per wave
+// when the desired spec asks for a rolling change.
+func (r *Reconciler) patchPhase(ctx context.Context, sts *appsv1.StatefulSet, desired *contract.DesiredSpec, a *drift.Assessment, wave []drift.Patch, status *contract.Status, specHash string) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
 
 	if reason := healthGate(sts); reason != "" {
@@ -392,12 +410,6 @@ func (r *Reconciler) patchPhase(ctx context.Context, sts *appsv1.StatefulSet, de
 		return ctrl.Result{}, nil
 	}
 
-	// Patch one wave: the PVCs of at most batchSize distinct ordinals
-	// (lowest first). Absent batchSize = everything at once. The backpressure
-	// rule in Reconcile keeps further waves from starting until this one has
-	// converged.
-	wave := waveOf(a.Patches, desired.BatchSize)
-
 	// Reset the convergence-timeout clock BEFORE patching anything: clear the
 	// previous wave's in-memory anchor and persist the Patching state. If
 	// either fails, no PVC has been touched and the retry starts clean — the
@@ -432,8 +444,8 @@ func (r *Reconciler) patchPhase(ctx context.Context, sts *appsv1.StatefulSet, de
 
 // convergencePhase waits for PVC status to catch up with the patched specs,
 // bounded by the convergence timeout (per wave: patchPhase resets the anchor
-// when it starts a new wave). While anything is converging, no further PVCs
-// are patched — Reconcile routes here before patchPhase.
+// when it starts a new wave). Reconcile routes here whenever the current wave
+// has nothing left to patch, so the next wave never starts early.
 func (r *Reconciler) convergencePhase(ctx context.Context, sts *appsv1.StatefulSet, a *drift.Assessment, status *contract.Status, specHash string) (ctrl.Result, error) {
 	if r.DryRun {
 		return ctrl.Result{}, nil

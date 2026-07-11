@@ -1199,11 +1199,38 @@ func TestWaveGroupsAllClaimsOfAnOrdinal(t *testing.T) {
 	}
 }
 
-func TestBackpressureWithoutBatchSize(t *testing.T) {
-	// Even with no batchSize, a PVC that is already converging blocks new
-	// patches: bounded in-flight modifications by construction.
-	desired := desiredJSON(t, map[string]map[string]string{"sqlite": {"storage": "200Gi"}})
+func TestPartialWaveCompletesBeforeNextWave(t *testing.T) {
+	// Ordinal 0 is already converging (a partially applied wave of 2), and
+	// ordinals 1-3 are still drifted. The wave must complete itself — patch
+	// ordinal 1 — without starting ordinals 2-3, so a replica's volumes are
+	// never left split across reconciles behind converging siblings.
+	spec := `{"version":1,"batchSize":2,"claims":{"sqlite":{"storage":"200Gi"}}}`
 	inflight := boundPVC("sqlite-broker-0", "fast", "200Gi", "100Gi") // spec patched, status lagging
+	f := newFixture(t,
+		healthySTS(map[string]string{contract.DesiredSpecAnnotation: spec}),
+		inflight,
+		boundPVC("sqlite-broker-1", "fast", "100Gi", "100Gi"),
+		boundPVC("sqlite-broker-2", "fast", "100Gi", "100Gi"),
+		boundPVC("sqlite-broker-3", "fast", "100Gi", "100Gi"),
+		expandableSC("fast"),
+	)
+
+	f.reconcile()
+	if got := f.getPVC("sqlite-broker-1").Spec.Resources.Requests[corev1.ResourceStorage]; got.String() != "200Gi" {
+		t.Fatal("ordinal 1 belongs to the in-flight wave and must be patched now")
+	}
+	for _, name := range []string{"sqlite-broker-2", "sqlite-broker-3"} {
+		if got := f.getPVC(name).Spec.Resources.Requests[corev1.ResourceStorage]; got.String() != "100Gi" {
+			t.Fatalf("%s belongs to the next wave and must wait", name)
+		}
+	}
+}
+
+func TestNoBatchSizeMeansAllAtOnce(t *testing.T) {
+	// Without batchSize the whole set is one wave: a PVC already converging
+	// does not delay patching the rest.
+	desired := desiredJSON(t, map[string]map[string]string{"sqlite": {"storage": "200Gi"}})
+	inflight := boundPVC("sqlite-broker-0", "fast", "200Gi", "100Gi")
 	f := newFixture(t,
 		healthySTS(map[string]string{contract.DesiredSpecAnnotation: desired}),
 		inflight,
@@ -1212,13 +1239,8 @@ func TestBackpressureWithoutBatchSize(t *testing.T) {
 	)
 
 	f.reconcile()
-	if got := f.getPVC("sqlite-broker-1").Spec.Resources.Requests[corev1.ResourceStorage]; got.String() != "100Gi" {
-		t.Fatal("no new patches while another PVC is converging")
-	}
-	f.simulateCSI("sqlite-broker-0")
-	f.reconcile()
 	if got := f.getPVC("sqlite-broker-1").Spec.Resources.Requests[corev1.ResourceStorage]; got.String() != "200Gi" {
-		t.Fatal("patching should resume once in-flight modifications converge")
+		t.Fatal("absent batchSize means all at once; converging PVCs must not delay the rest")
 	}
 }
 
