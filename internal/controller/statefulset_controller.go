@@ -451,8 +451,21 @@ func (r *Reconciler) patchPhase(ctx context.Context, sts *appsv1.StatefulSet, de
 	// itself without letting the next wave start early.
 	r.clearAnchor(sts.Namespace, sts.Name)
 	reason := ""
-	if remaining := len(a.Patches) - len(wave); remaining > 0 {
-		reason = fmt.Sprintf("wave of %d PVC(s) being patched; %d PVC(s) queued for later waves", len(wave), remaining)
+	if len(a.Patches) > len(wave) {
+		// Count in replicas, matching how batchSize is configured; the PVC
+		// count differs when a StatefulSet has several volumeClaimTemplates.
+		inWave := map[int]bool{}
+		for _, o := range waveOrdinals {
+			inWave[o] = true
+		}
+		queued := map[int]bool{}
+		for _, p := range a.Patches {
+			if !inWave[p.Ordinal] {
+				queued[p.Ordinal] = true
+			}
+		}
+		reason = fmt.Sprintf("patching wave of %d replica(s) (%d PVCs); %d replica(s) queued for later waves",
+			len(waveOrdinals), len(wave), len(queued))
 	}
 	if err := r.writeStatus(ctx, sts, &contract.Status{
 		Version:          contract.SupportedVersion,
