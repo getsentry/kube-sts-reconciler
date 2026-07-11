@@ -85,6 +85,9 @@ jobs:
     permissions:
       contents: read
       packages: write
+      # Required by the buildx GHA layer-cache backend (cache-from/cache-to
+      # type=gha); without it, cache writes fail and every build runs cold.
+      actions: write
     steps:
       - uses: actions/checkout@v4
       - uses: docker/setup-buildx-action@v3
