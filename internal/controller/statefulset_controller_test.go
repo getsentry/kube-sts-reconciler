@@ -1240,6 +1240,62 @@ func TestPartialWaveCompletesBeforeNextWave(t *testing.T) {
 	}
 }
 
+func TestGateBlockPreservesWaveRecord(t *testing.T) {
+	// The health gate closes mid-wave (partial wave: ordinal 0 converging,
+	// ordinal 1 unpatched). The Blocked status must carry the wave record,
+	// so the wave resumes — patching ordinal 1, not opening a new wave —
+	// once the gate clears.
+	spec := `{"version":1,"batchSize":2,"claims":{"sqlite":{"storage":"200Gi"}}}`
+	recorded := &contract.Status{
+		Version:          contract.SupportedVersion,
+		State:            contract.StatePatching,
+		ObservedSpecHash: contract.HashValue(spec),
+		WaveOrdinals:     []int{0, 1},
+		LastTransition:   time.Now().UTC(),
+	}
+	encoded, err := recorded.Encode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	sts := healthySTS(map[string]string{
+		contract.DesiredSpecAnnotation: spec,
+		contract.StatusAnnotation:      encoded,
+	})
+	sts.Status.ReadyReplicas = 0 // gate closed
+	f := newFixture(t, sts,
+		boundPVC("sqlite-broker-0", "fast", "200Gi", "100Gi"), // wave member, converging
+		boundPVC("sqlite-broker-1", "fast", "100Gi", "100Gi"), // wave member, unpatched
+		boundPVC("sqlite-broker-2", "fast", "100Gi", "100Gi"),
+		boundPVC("sqlite-broker-3", "fast", "100Gi", "100Gi"),
+		expandableSC("fast"),
+	)
+
+	f.reconcile() // blocked
+	st := f.status()
+	if st == nil || st.State != contract.StateBlocked {
+		t.Fatalf("status = %+v, want Blocked", st)
+	}
+	if len(st.WaveOrdinals) != 2 {
+		t.Fatalf("Blocked status must preserve the wave record, got %+v", st.WaveOrdinals)
+	}
+
+	// Gate clears: the recorded wave resumes.
+	cur := f.getSTS()
+	cur.Status.ReadyReplicas = 2
+	if err := f.client.Status().Update(context.Background(), cur); err != nil {
+		t.Fatal(err)
+	}
+	f.reconcile()
+	if got := f.getPVC("sqlite-broker-1").Spec.Resources.Requests[corev1.ResourceStorage]; got.String() != "200Gi" {
+		t.Fatal("recorded wave must resume after the gate clears")
+	}
+	for _, name := range []string{"sqlite-broker-2", "sqlite-broker-3"} {
+		if got := f.getPVC(name).Spec.Resources.Requests[corev1.ResourceStorage]; got.String() != "100Gi" {
+			t.Fatalf("%s must still wait for the next wave", name)
+		}
+	}
+}
+
 func TestNextWaveWaitsForWholeWave(t *testing.T) {
 	// Bugbot scenario: wave {0,1} in flight, ordinal 0 converges first. The
 	// next wave must NOT slide in while ordinal 1 is still converging.

@@ -384,11 +384,18 @@ func (r *Reconciler) gateBlocked(ctx context.Context, sts *appsv1.StatefulSet, s
 		return r.fail(ctx, sts, specHash, ReasonHealthGateTimeout,
 			fmt.Sprintf("health gate blocked reconciliation for more than %s: %s", r.gateTimeout(), reason), pvcStates)
 	}
+	// Carry any recorded rollout wave through the block, so an in-flight
+	// wave resumes correctly once the gate clears.
+	var waveOrdinals []int
+	if status != nil && status.ObservedSpecHash == specHash {
+		waveOrdinals = status.WaveOrdinals
+	}
 	if err := r.writeStatus(ctx, sts, &contract.Status{
 		Version:          contract.SupportedVersion,
 		State:            contract.StateBlocked,
 		ObservedSpecHash: specHash,
 		PVCs:             pvcStates,
+		WaveOrdinals:     waveOrdinals,
 		Reason:           reason,
 		LastTransition:   transition,
 	}); err != nil {
