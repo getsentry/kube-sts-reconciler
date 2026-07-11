@@ -287,16 +287,41 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	switch {
 	case a.Done():
 		return r.complete(ctx, sts)
+	case len(a.Waiting) > 0:
+		// Backpressure: never patch more PVCs while any already-patched PVC
+		// is still converging. This is what makes wave-based rollouts work,
+		// and it bounds in-flight volume modifications even without an
+		// explicit batchSize.
+		return r.convergencePhase(ctx, sts, a, status, specHash)
 	case !a.SpecsMatch():
 		return r.patchPhase(ctx, sts, desired, a, status, specHash)
-	case !a.Converged():
-		return r.convergencePhase(ctx, sts, a, status, specHash)
 	default:
 		// PVCs converged; only the StatefulSet's own volumeClaimTemplates
 		// still disagree. Orphan-delete so it can be recreated with matching
 		// templates.
 		return r.deletePhase(ctx, sts, desired, a, status, specHash)
 	}
+}
+
+// waveOf limits a sorted patch list to the PVCs of the first
+// `replicasPerWave` distinct ordinals, so a pod's volumes always move
+// together within one wave.
+func waveOf(patches []drift.Patch, replicasPerWave int) []drift.Patch {
+	if replicasPerWave <= 0 {
+		return patches
+	}
+	var out []drift.Patch
+	seen := map[int]bool{}
+	for _, p := range patches {
+		if !seen[p.Ordinal] {
+			if len(seen) == replicasPerWave {
+				break
+			}
+			seen[p.Ordinal] = true
+		}
+		out = append(out, p)
+	}
+	return out
 }
 
 // gateBlocked handles a closed health gate: warn, record the Blocked state,
@@ -328,7 +353,9 @@ func (r *Reconciler) gateBlocked(ctx context.Context, sts *appsv1.StatefulSet, s
 	return ctrl.Result{RequeueAfter: gateRequeue}, nil
 }
 
-// patchPhase validates prerequisites and patches every drifted PVC spec.
+// patchPhase validates prerequisites and patches drifted PVC specs — all at
+// once by default, or one wave of batchSize ordinals at a time when the
+// desired spec asks for a rolling change.
 func (r *Reconciler) patchPhase(ctx context.Context, sts *appsv1.StatefulSet, desired *contract.DesiredSpec, a *drift.Assessment, status *contract.Status, specHash string) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
 
@@ -345,13 +372,32 @@ func (r *Reconciler) patchPhase(ctx context.Context, sts *appsv1.StatefulSet, de
 		return ctrl.Result{RequeueAfter: gateRequeue}, nil
 	}
 
-	for _, p := range a.Patches {
-		if r.DryRun {
+	if r.DryRun {
+		// Nothing mutates in dry-run, so waves would never advance; preview
+		// every pending patch and the rest of the flow, then stop.
+		for _, p := range a.Patches {
 			msg := fmt.Sprintf("dry-run: would patch PVC %s (%s)", p.PVC.Name, describePatch(p))
 			log.Info(msg)
 			r.Recorder.Event(sts, corev1.EventTypeNormal, ReasonDryRun, msg)
-			continue
 		}
+		msg := "dry-run: would then wait for the CSI driver to converge PVC status"
+		if desired.BatchSize > 0 {
+			msg = fmt.Sprintf("dry-run: would patch in waves of %d replica(s), waiting for each wave to converge", desired.BatchSize)
+		}
+		if a.TemplateDrift {
+			msg += fmt.Sprintf(", then orphan-delete StatefulSet %s/%s for recreation with updated volumeClaimTemplates", sts.Namespace, sts.Name)
+		}
+		log.Info(msg)
+		r.Recorder.Event(sts, corev1.EventTypeNormal, ReasonDryRun, msg)
+		return ctrl.Result{}, nil
+	}
+
+	// Patch one wave: the PVCs of at most batchSize distinct ordinals
+	// (lowest first). Absent batchSize = everything at once. The backpressure
+	// rule in Reconcile keeps further waves from starting until this one has
+	// converged.
+	wave := waveOf(a.Patches, desired.BatchSize)
+	for _, p := range wave {
 		if err := r.applyPVCPatch(ctx, p); err != nil {
 			return ctrl.Result{}, fmt.Errorf("patching PVC %s: %w", p.PVC.Name, err)
 		}
@@ -360,22 +406,20 @@ func (r *Reconciler) patchPhase(ctx context.Context, sts *appsv1.StatefulSet, de
 		r.Recorder.Event(sts, corev1.EventTypeNormal, ReasonPVCPatched, msg)
 	}
 
-	if r.DryRun {
-		// Nothing was mutated, so re-assessing would do the same again;
-		// preview the rest of the flow, then stop for this StatefulSet.
-		msg := "dry-run: would then wait for the CSI driver to converge PVC status"
-		if a.TemplateDrift {
-			msg += fmt.Sprintf(", then orphan-delete StatefulSet %s/%s for recreation with updated volumeClaimTemplates", sts.Namespace, sts.Name)
-		}
-		log.Info(msg)
-		r.Recorder.Event(sts, corev1.EventTypeNormal, ReasonDryRun, msg)
-		return ctrl.Result{}, nil
+	// Each wave gets a fresh convergence-timeout clock: drop the in-memory
+	// anchor left by the previous wave's AwaitingConvergence.
+	r.clearAnchor(sts.Namespace, sts.Name)
+
+	reason := ""
+	if remaining := len(a.Patches) - len(wave); remaining > 0 {
+		reason = fmt.Sprintf("wave of %d PVC(s) patched; %d PVC(s) queued for later waves", len(wave), remaining)
 	}
 	if err := r.writeStatus(ctx, sts, &contract.Status{
 		Version:          contract.SupportedVersion,
 		State:            contract.StatePatching,
 		ObservedSpecHash: specHash,
 		PVCs:             a.PVCStates,
+		Reason:           reason,
 		LastTransition:   time.Now().UTC(),
 	}); err != nil {
 		return ctrl.Result{}, err
@@ -384,7 +428,9 @@ func (r *Reconciler) patchPhase(ctx context.Context, sts *appsv1.StatefulSet, de
 }
 
 // convergencePhase waits for PVC status to catch up with the patched specs,
-// bounded by the convergence timeout.
+// bounded by the convergence timeout (per wave: patchPhase resets the anchor
+// when it starts a new wave). While anything is converging, no further PVCs
+// are patched — Reconcile routes here before patchPhase.
 func (r *Reconciler) convergencePhase(ctx context.Context, sts *appsv1.StatefulSet, a *drift.Assessment, status *contract.Status, specHash string) (ctrl.Result, error) {
 	if r.DryRun {
 		return ctrl.Result{}, nil
@@ -856,13 +902,20 @@ func (r *Reconciler) listPVCsByClaims(ctx context.Context, namespace, stsName st
 			if !found {
 				continue
 			}
-			if _, err := strconv.Atoi(rest); err != nil {
+			ordinal, err := strconv.Atoi(rest)
+			if err != nil {
 				continue
 			}
-			out = append(out, drift.ClaimPVC{Claim: claim, PVC: pvc})
+			out = append(out, drift.ClaimPVC{Claim: claim, Ordinal: ordinal, PVC: pvc})
 		}
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].PVC.Name < out[j].PVC.Name })
+	// Numeric ordinal order (name order would put "-10" before "-2").
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Ordinal != out[j].Ordinal {
+			return out[i].Ordinal < out[j].Ordinal
+		}
+		return out[i].PVC.Name < out[j].PVC.Name
+	})
 	return out, nil
 }
 

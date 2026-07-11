@@ -19,16 +19,19 @@ func PVCName(claimName, stsName string, ordinal int32) string {
 	return fmt.Sprintf("%s-%s-%d", claimName, stsName, ordinal)
 }
 
-// ClaimPVC pairs an existing PVC with the volumeClaimTemplate it came from.
+// ClaimPVC pairs an existing PVC with the volumeClaimTemplate it came from
+// and the ordinal parsed from its name.
 type ClaimPVC struct {
-	Claim string
-	PVC   *corev1.PersistentVolumeClaim
+	Claim   string
+	Ordinal int
+	PVC     *corev1.PersistentVolumeClaim
 }
 
 // Patch describes the spec changes one PVC needs.
 type Patch struct {
-	Claim string
-	PVC   *corev1.PersistentVolumeClaim
+	Claim   string
+	Ordinal int
+	PVC     *corev1.PersistentVolumeClaim
 	// NewVAC, when non-nil, is the value for spec.volumeAttributesClassName.
 	NewVAC *string
 	// NewStorage, when non-empty, is the value for
@@ -141,13 +144,21 @@ func Assess(desired *contract.DesiredSpec, sts *appsv1.StatefulSet, pvcs []Claim
 		}
 		assessPVC(a, cp, want)
 	}
+	// Ordinal order: wave-based rollouts patch the lowest ordinals first, so
+	// a bad change is caught on ordinal 0 before it reaches the fleet.
+	sort.Slice(a.Patches, func(i, j int) bool {
+		if a.Patches[i].Ordinal != a.Patches[j].Ordinal {
+			return a.Patches[i].Ordinal < a.Patches[j].Ordinal
+		}
+		return a.Patches[i].PVC.Name < a.Patches[j].PVC.Name
+	})
 	a.TemplateDrift = templateDrift(desired, sts)
 	return a
 }
 
 func assessPVC(a *Assessment, cp ClaimPVC, want contract.ClaimDesired) {
 	pvc := cp.PVC
-	patch := Patch{Claim: cp.Claim, PVC: pvc}
+	patch := Patch{Claim: cp.Claim, Ordinal: cp.Ordinal, PVC: pvc}
 	fsResizePending := false
 
 	if want.VolumeAttributesClassName != nil {
