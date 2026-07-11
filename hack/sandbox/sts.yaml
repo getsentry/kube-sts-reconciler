@@ -1,7 +1,7 @@
 # StatefulSet template for the sandbox. Do not apply directly: the
 # __STORAGE__ and __VAC_LINE__ tokens are substituted by `just sandbox-up` /
 # `just sandbox-recreate`, which is also how a volumeClaimTemplates change
-# (normally sentry-kube's next deploy) is simulated after an orphan-delete.
+# (normally the next deploy) is simulated after an orphan-delete.
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
@@ -9,7 +9,7 @@ metadata:
   namespace: sandbox
   labels:
     app: broker
-    service: taskbroker
+    service: broker
 spec:
   replicas: 1
   serviceName: broker

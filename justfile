@@ -87,7 +87,7 @@ e2e-deployed: kind-up deploy-kind test-e2e-deployed
 
 # Run the controller locally against the current kubeconfig in dry-run mode
 run-dry-run:
-    go run ./cmd --dry-run --label-selector= --metrics-bind-address=0 --health-probe-bind-address=0
+    go run ./cmd --dry-run --metrics-bind-address=0 --health-probe-bind-address=0
 
 clean:
     go clean ./...

@@ -10,8 +10,10 @@ imagePullSecrets: []
 replicaCount: 1
 
 controller:
-  # Only StatefulSets matching this selector are reconciled. Empty selects everything.
-  labelSelector: "service=taskbroker"
+  # Only StatefulSets matching this selector are reconciled. Empty selects
+  # everything (the controller is still inert without the opt-in annotation);
+  # scoping to the services that need it is recommended.
+  labelSelector: ""
   # Who recreates the StatefulSet after the orphan-delete:
   #   deploy - the next deploy/apply re-applies it (controller stays stateless)
   #   self   - the controller snapshots the manifest and recreates it itself

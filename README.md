@@ -41,7 +41,7 @@ See [docs/implementation-plan.md](docs/implementation-plan.md) for the full desi
 
 ```sh
 go run ./cmd \
-  --label-selector=service=taskbroker \  # scope; empty watches everything
+  --label-selector=service=my-broker \   # scope; empty (the default) watches everything
   --dry-run \                            # log intended actions, mutate nothing
   --convergence-timeout=10m
 ```
@@ -66,7 +66,7 @@ to GHCR on version tags):
 ```sh
 helm install ksr oci://ghcr.io/getsentry/charts/kube-sts-reconciler \
   --namespace sts-reconciler-system --create-namespace \
-  --set controller.labelSelector="service=taskbroker" \
+  --set controller.labelSelector="service=my-broker" \
   --set controller.recreateMode=deploy \
   --set controller.dryRun=true          # recommended for the first rollout
 ```
@@ -81,31 +81,10 @@ One-time setup after the first release: flip the GHCR package visibility to **pu
 for both `kube-sts-reconciler` (image) and `charts/kube-sts-reconciler` (chart) — GHCR
 packages are created private by default.
 
-### Consuming from getsentry/ops (sentry-kube)
-
-The public OCI chart is consumed exactly like other third-party operators in
-`k8s/helm_services/` (`kube-binpacking-exporter` is the closest precedent — a
-controller pulled from a public GHCR OCI chart):
-
-```yaml
-# ops: k8s/helm_services/kube-sts-reconciler/_helm.yaml
-chart:
-  name: kube-sts-reconciler
-  repository: oci://ghcr.io/getsentry/charts/kube-sts-reconciler
-  version: 0.1.0            # pinned; bump deliberately
-  dynamic_app_version: false
-
-releases:
-  - name: kube-sts-reconciler
-    namespace: sts-reconciler-system
-    use:
-      - 00.default.yaml
-```
-
-with per-cluster policy (`controller.labelSelector`, `controller.recreateMode`,
-`controller.dryRun`) in the layered values files (`00.default.yaml`,
-`50.<region>.yaml`), the service listed under `helm.services:` in each cluster
-config, and a GoCD pipeline applying it via `sentry-kube helm apply`.
+Deploy systems that manage Helm releases declaratively (Argo CD, Flux, in-house
+tooling) can consume the chart like any other public OCI chart: pin a chart
+`version`, and put per-cluster policy (`controller.labelSelector`,
+`controller.recreateMode`, `controller.dryRun`) in per-cluster values.
 
 ## Development & testing
 

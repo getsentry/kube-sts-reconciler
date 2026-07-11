@@ -98,7 +98,7 @@ func startManager(t *testing.T, ctx context.Context, scheme *runtime.Scheme) {
 		Recorder:           mgr.GetEventRecorderFor("sts-volume-reconciler"),
 		ConvergenceTimeout: 5 * time.Minute,
 	}
-	if err := r.SetupWithManager(mgr, "service=taskbroker"); err != nil {
+	if err := r.SetupWithManager(mgr, "service=broker"); err != nil {
 		t.Fatal(err)
 	}
 	go func() {
@@ -138,7 +138,7 @@ func newSTS(storage string, vac *string) *appsv1.StatefulSet {
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      stsName,
 			Namespace: ns,
-			Labels:    map[string]string{"app": stsName, "service": "taskbroker"},
+			Labels:    map[string]string{"app": stsName, "service": "broker"},
 		},
 		Spec: appsv1.StatefulSetSpec{
 			Replicas:    &replicas,
@@ -257,7 +257,7 @@ func TestEndToEnd(t *testing.T) {
 		return pvc.Status.Phase == corev1.ClaimBound, nil
 	})
 
-	// --- stamp the annotation, exactly as sentry-kube (or kubectl) would ---
+	// --- stamp the annotation, exactly as a deploy pipeline (or kubectl) would ---
 	sts := &appsv1.StatefulSet{}
 	if err := c.Get(ctx, types.NamespacedName{Namespace: ns, Name: stsName}, sts); err != nil {
 		t.Fatal(err)

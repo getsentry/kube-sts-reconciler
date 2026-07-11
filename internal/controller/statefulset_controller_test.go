@@ -172,7 +172,7 @@ func healthySTS(annotations map[string]string) *appsv1.StatefulSet {
 		ObjectMeta: metav1.ObjectMeta{
 			Name:        testSTS,
 			Namespace:   testNS,
-			Labels:      map[string]string{"service": "taskbroker"},
+			Labels:      map[string]string{"service": "broker"},
 			Annotations: annotations,
 		},
 		Spec: appsv1.StatefulSetSpec{
@@ -654,7 +654,7 @@ func TestSelectorEnforcedOutsideInformer(t *testing.T) {
 	sts := healthySTS(map[string]string{contract.DesiredSpecAnnotation: desired})
 	sts.Labels = map[string]string{"service": "other"}
 	f := newFixture(t, sts, boundPVC("sqlite-broker-0", "fast", "100Gi", "100Gi"), expandableSC("fast"))
-	sel, err := metav1.ParseToLabelSelector("service=taskbroker")
+	sel, err := metav1.ParseToLabelSelector("service=broker")
 	if err != nil {
 		t.Fatal(err)
 	}
