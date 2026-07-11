@@ -62,6 +62,12 @@ jobs:
           helm template ksr charts/kube-sts-reconciler > /dev/null
           helm template ksr charts/kube-sts-reconciler --set controller.recreateMode=self > /dev/null
           helm template ksr charts/kube-sts-reconciler --set controller.dryRun=true --set controller.leaderElection=false > /dev/null
+          helm template ksr charts/kube-sts-reconciler --set replicaCount=2 > /dev/null
+          # Multiple replicas without leader election must refuse to render.
+          if helm template ksr charts/kube-sts-reconciler --set replicaCount=2 --set controller.leaderElection=false > /dev/null 2>&1; then
+            echo "expected render to fail: replicaCount>1 without leader election" >&2
+            exit 1
+          fi
 
   e2e-deployed:
     runs-on: ubuntu-latest

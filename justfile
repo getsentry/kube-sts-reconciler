@@ -64,9 +64,17 @@ kind-load: build-image
 
 # Lint the Helm chart and render both recreate modes
 helm-lint:
+    #!/usr/bin/env bash
+    set -euo pipefail
     helm lint charts/kube-sts-reconciler
     helm template ksr charts/kube-sts-reconciler > /dev/null
     helm template ksr charts/kube-sts-reconciler --set controller.recreateMode=self > /dev/null
+    helm template ksr charts/kube-sts-reconciler --set replicaCount=2 > /dev/null
+    # Multiple replicas without leader election must refuse to render.
+    if helm template ksr charts/kube-sts-reconciler --set replicaCount=2 --set controller.leaderElection=false > /dev/null 2>&1; then
+        echo "expected render to fail: replicaCount>1 without leader election" >&2
+        exit 1
+    fi
 
 # Install the chart into the kind cluster using the locally built image
 deploy-kind: kind-load

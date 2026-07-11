@@ -7,6 +7,8 @@ image:
 imagePullSecrets: []
 
 # Single replica with leader election: rolling updates cannot double-reconcile.
+# The chart refuses to render replicaCount > 1 with controller.leaderElection
+# disabled — concurrent unguarded replicas would race on the same StatefulSets.
 replicaCount: 1
 
 controller:
