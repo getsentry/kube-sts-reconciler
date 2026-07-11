@@ -66,12 +66,15 @@ kind-load: build-image
 helm-lint:
     #!/usr/bin/env bash
     set -euo pipefail
+    # --kube-version: offline rendering defaults to v1.20, below the chart's
+    # kubeVersion floor; match what the e2e cluster runs.
+    tpl="helm template ksr charts/kube-sts-reconciler --kube-version 1.33.0"
     helm lint charts/kube-sts-reconciler
-    helm template ksr charts/kube-sts-reconciler > /dev/null
-    helm template ksr charts/kube-sts-reconciler --set controller.recreateMode=self > /dev/null
-    helm template ksr charts/kube-sts-reconciler --set replicaCount=2 > /dev/null
+    $tpl > /dev/null
+    $tpl --set controller.recreateMode=self > /dev/null
+    $tpl --set replicaCount=2 > /dev/null
     # Multiple replicas without leader election must refuse to render.
-    if helm template ksr charts/kube-sts-reconciler --set replicaCount=2 --set controller.leaderElection=false > /dev/null 2>&1; then
+    if $tpl --set replicaCount=2 --set controller.leaderElection=false > /dev/null 2>&1; then
         echo "expected render to fail: replicaCount>1 without leader election" >&2
         exit 1
     fi
