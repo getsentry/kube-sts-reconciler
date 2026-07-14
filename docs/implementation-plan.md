@@ -103,8 +103,8 @@ Schema rules:
         "state": "Patching",
         "observedSpecHash": "sha256:…",
         "pvcs": {
-          "sqlite-task-process-segments-broker-0": "Converged",
-          "sqlite-task-process-segments-broker-1": "Modifying"
+          "sqlite-broker-0": "Converged",
+          "sqlite-broker-1": "Modifying"
         },
         "reason": "",
         "lastTransition": "2026-07-10T15:30:00Z"
