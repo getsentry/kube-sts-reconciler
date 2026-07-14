@@ -1,6 +1,6 @@
 # Build: docker build -t kube-sts-reconciler .
 # The final image is distroless: the static manager binary and nothing else.
-FROM golang:1.24 AS build
+FROM golang:1.25 AS build
 WORKDIR /src
 
 COPY go.mod go.sum ./
