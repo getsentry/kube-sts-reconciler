@@ -55,6 +55,10 @@ func TestParseDesiredSpecRejects(t *testing.T) {
 		"zero storage":  {`{"version":1,"claims":{"a":{"storage":"0"}}}`, "positive quantity"},
 		"negative":      {`{"version":1,"claims":{"a":{"storage":"-5Gi"}}}`, "positive quantity"},
 		"bad quantity":  {`{"version":1,"claims":{"a":{"storage":"333GiB"}}}`, "invalid JSON"},
+		"negative batch": {
+			`{"version":1,"batchSize":-1,"claims":{"a":{"storage":"1Gi"}}}`,
+			"batchSize must be zero",
+		},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -66,6 +70,23 @@ func TestParseDesiredSpecRejects(t *testing.T) {
 				t.Fatalf("error %q does not contain %q", err, tc.wantErr)
 			}
 		})
+	}
+}
+
+func TestParseBatchSize(t *testing.T) {
+	spec, err := ParseDesiredSpec(`{"version":1,"batchSize":3,"claims":{"a":{"storage":"1Gi"}}}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if spec.BatchSize != 3 {
+		t.Fatalf("BatchSize = %d, want 3", spec.BatchSize)
+	}
+	spec, err = ParseDesiredSpec(`{"version":1,"claims":{"a":{"storage":"1Gi"}}}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if spec.BatchSize != 0 {
+		t.Fatalf("absent batchSize should parse as 0 (all at once), got %d", spec.BatchSize)
 	}
 }
 

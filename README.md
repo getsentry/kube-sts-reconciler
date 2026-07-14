@@ -17,6 +17,10 @@ kubectl annotate sts my-broker 'sts-reconciler.sentry.io/desired-pvc-spec=
 {"version":1,"claims":{"data":{"volumeAttributesClassName":"vac-fast","storage":"333Gi"}}}'
 ```
 
+For large StatefulSets, add `"batchSize": N` to roll the change through N replicas at a
+time (lowest ordinals first, each wave fully converged before the next) instead of
+modifying every volume simultaneously.
+
 The controller then, in order (safest step first, destructive step last):
 
 1. **Validates** — health gate, VAC exists, StorageClass allows expansion, no shrinks,
