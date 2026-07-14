@@ -137,7 +137,16 @@ sandbox-annotate storage="2Gi" vac="vac-fast":
 sandbox-status:
     #!/usr/bin/env bash
     echo "=== StatefulSet annotations ==="
-    kubectl -n sandbox get sts broker -o jsonpath='{.metadata.annotations}' 2>/dev/null | python3 -m json.tool 2>/dev/null || echo "(StatefulSet not found — orphan-deleted, awaiting recreate?)"
+    if ! kubectl -n sandbox get sts broker > /dev/null 2>&1; then
+        echo "(StatefulSet not found — orphan-deleted, awaiting recreate?)"
+    else
+        ann=$(kubectl -n sandbox get sts broker -o jsonpath='{.metadata.annotations}' 2>/dev/null)
+        if [ -n "$ann" ]; then
+            echo "$ann" | python3 -m json.tool 2>/dev/null || echo "$ann"
+        else
+            echo "(no annotations — reconcile complete)"
+        fi
+    fi
     echo
     echo "=== PVCs (spec request / VAC -> status capacity / current VAC) ==="
     kubectl -n sandbox get pvc -o custom-columns='NAME:.metadata.name,REQ:.spec.resources.requests.storage,VAC:.spec.volumeAttributesClassName,CAP:.status.capacity.storage,CURVAC:.status.currentVolumeAttributesClassName' 2>/dev/null
