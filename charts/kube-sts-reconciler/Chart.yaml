@@ -1,0 +1,33 @@
+apiVersion: v2
+name: kube-sts-reconciler
+description: >-
+  Annotation-driven controller that automates PVC patching and StatefulSet
+  orphan-delete/recreate when volumeClaimTemplates change.
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+kubeVersion: ">=1.31.0-0"
+home: https://github.com/getsentry/kube-sts-reconciler
+sources:
+  - https://github.com/getsentry/kube-sts-reconciler
+keywords:
+  - statefulset
+  - persistentvolumeclaim
+  - volumeattributesclass
+  - volume-expansion
+  - storage
+  - controller
+maintainers:
+  - name: Sentry
+    url: https://github.com/getsentry
+annotations:
+  artifacthub.io/license: MIT
+  artifacthub.io/operator: "true"
+  artifacthub.io/links: |
+    - name: Documentation
+      url: https://github.com/getsentry/kube-sts-reconciler#readme
+    - name: Design
+      url: https://github.com/getsentry/kube-sts-reconciler/blob/main/docs/implementation-plan.md
+  artifacthub.io/changes: |
+    - kind: added
+      description: Initial release - annotation-driven PVC patching and StatefulSet orphan-delete/recreate

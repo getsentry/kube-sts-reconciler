@@ -45,7 +45,7 @@ func main() {
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8080", "Address for the Prometheus metrics endpoint.")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "Address for liveness/readiness probes.")
 	flag.BoolVar(&leaderElect, "leader-elect", false, "Enable leader election (required when running more than one replica).")
-	flag.StringVar(&labelSelector, "label-selector", "service=taskbroker", "Only reconcile StatefulSets matching this label selector. Empty selects everything.")
+	flag.StringVar(&labelSelector, "label-selector", "", "Only reconcile StatefulSets matching this label selector. Empty (the default) selects everything; scoping to the services that need it is recommended.")
 	flag.BoolVar(&dryRun, "dry-run", false, "Log and emit events for intended actions without mutating anything.")
 	flag.DurationVar(&convergenceTimeout, "convergence-timeout", 10*time.Minute, "How long PVC status may lag the patched spec before the reconcile is marked Failed.")
 	flag.DurationVar(&gateTimeout, "gate-timeout", 10*time.Minute, "How long the health gate may block a reconcile before it is marked Failed.")

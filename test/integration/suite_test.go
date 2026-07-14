@@ -95,7 +95,7 @@ func TestMain(m *testing.M) {
 		Client:   mgr.GetClient(),
 		Recorder: mgr.GetEventRecorderFor("sts-volume-reconciler"),
 	}
-	if err := r.SetupWithManager(mgr, "service=taskbroker"); err != nil {
+	if err := r.SetupWithManager(mgr, "service=broker"); err != nil {
 		fmt.Printf("failed to set up reconciler: %v\n", err)
 		os.Exit(1)
 	}
@@ -106,7 +106,7 @@ func TestMain(m *testing.M) {
 		Recorder:     mgr.GetEventRecorderFor("sts-volume-reconciler-self"),
 		SelfRecreate: true,
 	}
-	if err := rSelf.SetupWithManager(mgr, "service=taskbroker-self"); err != nil {
+	if err := rSelf.SetupWithManager(mgr, "service=broker-self"); err != nil {
 		fmt.Printf("failed to set up self-recreate reconciler: %v\n", err)
 		os.Exit(1)
 	}
@@ -190,7 +190,7 @@ func createVAC(t *testing.T, name string) {
 func strp(s string) *string { return &s }
 
 func newSTS(ns, scName string, replicas int32) *appsv1.StatefulSet {
-	labels := map[string]string{"app": stsName, "service": "taskbroker"}
+	labels := map[string]string{"app": stsName, "service": "broker"}
 	return &appsv1.StatefulSet{
 		ObjectMeta: metav1.ObjectMeta{Name: stsName, Namespace: ns, Labels: labels},
 		Spec: appsv1.StatefulSetSpec{
@@ -486,7 +486,7 @@ func TestSelfRecreateLoop(t *testing.T) {
 	createVAC(t, "vac-fast")
 
 	sts := newSTS(ns, "expandable", 1)
-	sts.Labels["service"] = "taskbroker-self" // routed to the self-recreate reconciler
+	sts.Labels["service"] = "broker-self" // routed to the self-recreate reconciler
 	if err := k8sClient.Create(ctxT(t), sts); err != nil {
 		t.Fatal(err)
 	}

@@ -21,7 +21,7 @@ func snapshotInput(t *testing.T) (*appsv1.StatefulSet, *contract.DesiredSpec) {
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "broker",
 			Namespace: "default",
-			Labels:    map[string]string{"service": "taskbroker"},
+			Labels:    map[string]string{"service": "broker"},
 			Annotations: map[string]string{
 				contract.DesiredSpecAnnotation:                     `{"version":1}`,
 				contract.StatusAnnotation:                          `{"state":"Deleting"}`,
@@ -88,7 +88,7 @@ func TestSnapshotRoundTrip(t *testing.T) {
 		}
 	}
 	// User content is preserved.
-	if back.Annotations["team"] != "processing" || back.Labels["service"] != "taskbroker" {
+	if back.Annotations["team"] != "processing" || back.Labels["service"] != "broker" {
 		t.Fatal("user labels/annotations must be preserved")
 	}
 	if back.Spec.Replicas == nil || *back.Spec.Replicas != 2 {

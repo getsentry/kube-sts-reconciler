@@ -1,0 +1,14 @@
+{{ .Chart.Name }} {{ .Chart.Version }} deployed as {{ include "ksr.fullname" . }} in {{ .Release.Namespace }}.
+
+Mode: --recreate-mode={{ .Values.controller.recreateMode }}{{ if .Values.controller.dryRun }} (DRY-RUN: no mutations){{ end }}
+Scope: --label-selector={{ .Values.controller.labelSelector | default "(everything)" }}
+
+Drive a reconcile by stamping the annotation on a matching StatefulSet:
+
+  kubectl -n <ns> annotate sts <name> \
+    'sts-reconciler.sentry.io/desired-pvc-spec={"version":1,"claims":{"<claim>":{"storage":"<size>"}}}'
+
+Watch progress:
+
+  kubectl -n <ns> get sts <name> -o jsonpath='{.metadata.annotations.sts-reconciler\.sentry\.io/status}'
+  kubectl -n <ns> get events --field-selector involvedObject.name=<name>

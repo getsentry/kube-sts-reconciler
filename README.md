@@ -45,7 +45,7 @@ See [docs/implementation-plan.md](docs/implementation-plan.md) for the full desi
 
 ```sh
 go run ./cmd \
-  --label-selector=service=taskbroker \  # scope; empty watches everything
+  --label-selector=service=my-broker \   # scope; empty (the default) watches everything
   --dry-run \                            # log intended actions, mutate nothing
   --convergence-timeout=10m
 ```
@@ -61,6 +61,34 @@ go run ./cmd \
   anchored by a content hash stamped on the PVCs, so a forged ConfigMap cannot make
   the controller create arbitrary StatefulSets. Requires extra RBAC (`create` on
   statefulsets, read/write on configmaps).
+
+## Deploying
+
+The controller ships as a distroless container image and a Helm chart (both published
+to GHCR on version tags):
+
+```sh
+helm install ksr oci://ghcr.io/getsentry/charts/kube-sts-reconciler \
+  --namespace sts-reconciler-system --create-namespace \
+  --set controller.labelSelector="service=my-broker" \
+  --set controller.recreateMode=deploy \
+  --set controller.dryRun=true          # recommended for the first rollout
+```
+
+The chart encodes the least-privilege RBAC split: `controller.recreateMode=self` is the
+only thing that grants `create` on StatefulSets and write access to ConfigMaps. See
+[charts/kube-sts-reconciler/values.yaml](charts/kube-sts-reconciler/values.yaml) for
+all knobs (timeouts, metrics, resources, scheduling). Environments that don't consume
+Helm directly can render plain manifests with `helm template`.
+
+One-time setup after the first release: flip the GHCR package visibility to **public**
+for both `kube-sts-reconciler` (image) and `charts/kube-sts-reconciler` (chart) — GHCR
+packages are created private by default.
+
+Deploy systems that manage Helm releases declaratively (Argo CD, Flux, in-house
+tooling) can consume the chart like any other public OCI chart: pin a chart
+`version`, and put per-cluster policy (`controller.labelSelector`,
+`controller.recreateMode`, `controller.dryRun`) in per-cluster values.
 
 ## Development & testing
 

@@ -49,9 +49,56 @@ test-e2e:
 # Full e2e: create the kind cluster, then run the e2e tests against it
 e2e: kind-up test-e2e
 
+# --- Packaged deployment (image + Helm chart) --------------------------------
+
+image_name := env_var_or_default("IMAGE_NAME", "kube-sts-reconciler")
+image_tag := env_var_or_default("IMAGE_TAG", "dev")
+
+# Build the controller container image (distroless)
+build-image:
+    docker build -t {{image_name}}:{{image_tag}} .
+
+# Load the locally built image into the kind cluster
+kind-load: build-image
+    kind load docker-image {{image_name}}:{{image_tag}} --name {{kind_cluster}}
+
+# Lint the Helm chart and render both recreate modes
+helm-lint:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    # --kube-version: offline rendering defaults to v1.20, below the chart's
+    # kubeVersion floor; match what the e2e cluster runs.
+    tpl="helm template ksr charts/kube-sts-reconciler --kube-version 1.33.0"
+    helm lint charts/kube-sts-reconciler
+    $tpl > /dev/null
+    $tpl --set controller.recreateMode=self > /dev/null
+    $tpl --set replicaCount=2 > /dev/null
+    # Multiple replicas without leader election must refuse to render.
+    if $tpl --set replicaCount=2 --set controller.leaderElection=false > /dev/null 2>&1; then
+        echo "expected render to fail: replicaCount>1 without leader election" >&2
+        exit 1
+    fi
+
+# Install the chart into the kind cluster using the locally built image
+deploy-kind: kind-load
+    kubectl config use-context kind-{{kind_cluster}}
+    helm upgrade --install ksr charts/kube-sts-reconciler \
+        --namespace sts-reconciler-system --create-namespace \
+        --set image.repository={{image_name}} --set image.tag={{image_tag}} \
+        --set image.pullPolicy=Never
+    kubectl -n sts-reconciler-system rollout status deploy/ksr-kube-sts-reconciler --timeout=120s
+
+# E2E against the helm-deployed in-cluster controller (real image, RBAC, probes)
+test-e2e-deployed:
+    kubectl config use-context kind-{{kind_cluster}}
+    E2E_DEPLOYED=1 go test -tags e2e -v -timeout 20m ./test/e2e/...
+
+# Full deployed e2e: cluster + image + chart + tests
+e2e-deployed: kind-up deploy-kind test-e2e-deployed
+
 # Run the controller locally against the current kubeconfig in dry-run mode
 run-dry-run:
-    go run ./cmd --dry-run --label-selector= --metrics-bind-address=0 --health-probe-bind-address=0
+    go run ./cmd --dry-run --metrics-bind-address=0 --health-probe-bind-address=0
 
 clean:
     go clean ./...
@@ -89,8 +136,20 @@ sandbox-annotate storage="2Gi" vac="vac-fast":
 # Show reconcile state: annotations, PVC spec vs status, recent events
 sandbox-status:
     #!/usr/bin/env bash
-    echo "=== StatefulSet annotations ==="
-    kubectl -n sandbox get sts broker -o jsonpath='{.metadata.annotations}' 2>/dev/null | python3 -m json.tool 2>/dev/null || echo "(StatefulSet not found — orphan-deleted, awaiting recreate?)"
+    echo "=== StatefulSet ==="
+    if ! kubectl -n sandbox get sts broker > /dev/null 2>&1; then
+        echo "(not found — orphan-deleted, awaiting recreate?)"
+    else
+        kubectl -n sandbox get sts broker -o custom-columns='NAME:.metadata.name,READY:.status.readyReplicas,REPLICAS:.spec.replicas,STORAGE:.spec.volumeClaimTemplates[0].spec.resources.requests.storage,VAC:.spec.volumeClaimTemplates[0].spec.volumeAttributesClassName' 2>/dev/null
+        echo
+        echo "=== StatefulSet annotations ==="
+        ann=$(kubectl -n sandbox get sts broker -o jsonpath='{.metadata.annotations}' 2>/dev/null)
+        if [ -n "$ann" ]; then
+            echo "$ann" | python3 -m json.tool 2>/dev/null || echo "$ann"
+        else
+            echo "(no annotations — reconcile complete)"
+        fi
+    fi
     echo
     echo "=== PVCs (spec request / VAC -> status capacity / current VAC) ==="
     kubectl -n sandbox get pvc -o custom-columns='NAME:.metadata.name,REQ:.spec.resources.requests.storage,VAC:.spec.volumeAttributesClassName,CAP:.status.capacity.storage,CURVAC:.status.currentVolumeAttributesClassName' 2>/dev/null

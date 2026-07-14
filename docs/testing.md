@@ -22,7 +22,7 @@ with `csisim.sentry.io/infeasible: "true"` makes it report the VAC change as
 `Infeasible` instead, for failure-path testing.
 
 This means the harness validates the *controller's* behavior (the point of the
-experiment), while real-CSI behavior stays a milestone-2 concern on s4s2.
+experiment), while real-CSI behavior stays a milestone-2 concern on a staging cluster.
 
 ## Unit tests
 
@@ -69,7 +69,7 @@ The test then:
 1. Starts the manager **in-process** against the kind kubeconfig (no image build —
    fast iteration) and `csisim` alongside it.
 2. Creates an expandable StorageClass backed by local-path, a VolumeAttributesClass,
-   and a 1-replica StatefulSet (`service=taskbroker`) with a mounted 1Gi claim, then
+   and a 1-replica StatefulSet (`service=broker`) with a mounted 1Gi claim, then
    waits for the pod to be Running with a Bound PVC.
 3. Stamps the desired-spec annotation asking for the VAC plus 2Gi.
 4. Watches the controller patch the PVC, csisim converge it, and the controller
@@ -80,13 +80,23 @@ The test then:
 Safety: the test inspects the current kubeconfig context and refuses to run unless it
 starts with `kind-`. It cannot be pointed at a real cluster by accident.
 
+### Deployed variant
+
+`just e2e-deployed` runs the same test against the controller **deployed the way
+production would run it**: it builds the distroless image, `kind load`s it, installs
+the Helm chart (`charts/kube-sts-reconciler`) into `sts-reconciler-system`, waits for
+rollout, and runs the suite with `E2E_DEPLOYED=1` so no in-process manager starts.
+This is the only layer that exercises the real image, the chart's RBAC, and the
+health probes — an RBAC mistake in the chart fails here instead of during a cluster
+rollout.
+
 ### Manual poking
 
 The e2e test cleans up after itself, so a fresh kind cluster has nothing to poke.
 The `sandbox-*` recipes provision a standalone workload: namespace `sandbox` with an
 expandable StorageClass, a VolumeAttributesClass `vac-fast`, and a 1-replica
-StatefulSet `broker` (labeled `service=taskbroker`, so the controller's default
-selector matches) with a mounted 1Gi claim named `data`.
+StatefulSet `broker` (labeled `service=broker`; the controller's default selector
+is empty, which matches everything) with a mounted 1Gi claim named `data`.
 
 You'll want three terminals — sandbox commands, the CSI simulator, and the controller:
 

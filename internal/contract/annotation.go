@@ -1,5 +1,5 @@
-// Package contract defines the annotation-based API between sentry-kube (or a
-// human operator) and the reconciler. See docs/implementation-plan.md §3.
+// Package contract defines the annotation-based API between deploy tooling
+// (or a human operator) and the reconciler. See docs/implementation-plan.md §3.
 package contract
 
 import (
@@ -18,8 +18,8 @@ const (
 	// Domain is the annotation namespace shared by all reconciler keys.
 	Domain = "sts-reconciler.sentry.io"
 
-	// DesiredSpecAnnotation carries the desired PVC spec, written by
-	// sentry-kube (or kubectl) and cleared by the controller on convergence.
+	// DesiredSpecAnnotation carries the desired PVC spec, written by deploy
+	// tooling (or kubectl) and cleared by the controller on convergence.
 	DesiredSpecAnnotation = Domain + "/desired-pvc-spec"
 
 	// StatusAnnotation tracks reconcile progress. Written and cleared only by
