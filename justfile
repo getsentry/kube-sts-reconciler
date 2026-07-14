@@ -136,10 +136,13 @@ sandbox-annotate storage="2Gi" vac="vac-fast":
 # Show reconcile state: annotations, PVC spec vs status, recent events
 sandbox-status:
     #!/usr/bin/env bash
-    echo "=== StatefulSet annotations ==="
+    echo "=== StatefulSet ==="
     if ! kubectl -n sandbox get sts broker > /dev/null 2>&1; then
-        echo "(StatefulSet not found — orphan-deleted, awaiting recreate?)"
+        echo "(not found — orphan-deleted, awaiting recreate?)"
     else
+        kubectl -n sandbox get sts broker -o custom-columns='NAME:.metadata.name,READY:.status.readyReplicas,REPLICAS:.spec.replicas,STORAGE:.spec.volumeClaimTemplates[0].spec.resources.requests.storage,VAC:.spec.volumeClaimTemplates[0].spec.volumeAttributesClassName' 2>/dev/null
+        echo
+        echo "=== StatefulSet annotations ==="
         ann=$(kubectl -n sandbox get sts broker -o jsonpath='{.metadata.annotations}' 2>/dev/null)
         if [ -n "$ann" ]; then
             echo "$ann" | python3 -m json.tool 2>/dev/null || echo "$ann"
