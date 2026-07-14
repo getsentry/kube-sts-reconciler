@@ -34,6 +34,7 @@ jobs:
             ghcr.io/${{ github.repository }}:latest
 
   chart:
+    needs: [image]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
