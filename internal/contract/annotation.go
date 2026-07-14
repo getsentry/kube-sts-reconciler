@@ -63,6 +63,15 @@ type DesiredSpec struct {
 	Version int                     `json:"version"`
 	Claims  map[string]ClaimDesired `json:"claims"`
 
+	// BatchSize limits how many replicas' volumes are modified concurrently:
+	// the controller patches the PVCs of at most this many ordinals per wave
+	// and waits for the wave to converge before starting the next. Zero or
+	// absent means all at once. For large StatefulSets a small batch bounds
+	// the blast radius of a bad change (canary on the first ordinals) and
+	// avoids a correlated performance dip across every replica while the CSI
+	// driver modifies volumes.
+	BatchSize int `json:"batchSize,omitempty"`
+
 	// Raw is the annotation value the spec was parsed from; used for hashing.
 	Raw string `json:"-"`
 }
@@ -82,8 +91,13 @@ type Status struct {
 	State            State             `json:"state"`
 	ObservedSpecHash string            `json:"observedSpecHash"`
 	PVCs             map[string]string `json:"pvcs,omitempty"`
-	Reason           string            `json:"reason,omitempty"`
-	LastTransition   time.Time         `json:"lastTransition"`
+	// WaveOrdinals records which ordinals belong to the rollout wave
+	// currently in flight (batchSize > 0 only). Persisted before any PVC in
+	// the wave is patched, so wave membership survives crashes and partial
+	// patches without in-memory state.
+	WaveOrdinals   []int     `json:"waveOrdinals,omitempty"`
+	Reason         string    `json:"reason,omitempty"`
+	LastTransition time.Time `json:"lastTransition"`
 }
 
 // ParseDesiredSpec parses and validates the desired-pvc-spec annotation value.
@@ -104,6 +118,9 @@ func ParseDesiredSpec(value string) (*DesiredSpec, error) {
 	}
 	if len(spec.Claims) == 0 {
 		return nil, fmt.Errorf("%s must list at least one claim", DesiredSpecAnnotation)
+	}
+	if spec.BatchSize < 0 {
+		return nil, fmt.Errorf("batchSize must be zero (all at once) or positive, got %d", spec.BatchSize)
 	}
 	for name, claim := range spec.Claims {
 		if claim.VolumeAttributesClassName == nil && claim.Storage == nil {

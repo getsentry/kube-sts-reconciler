@@ -73,6 +73,16 @@ metadata:
 Schema rules:
 
 - `version` (int, required): contract version; the controller rejects versions it doesn't know.
+- `batchSize` (int, optional): maximum number of **replicas** whose volumes are modified
+  concurrently. The controller patches the PVCs of the lowest `batchSize` ordinals, waits
+  for that wave to fully converge, then starts the next — canary-first, with a fresh
+  convergence-timeout clock per wave. Zero or absent = all at once. Recommended for large
+  StatefulSets: it bounds the blast radius of a bad change and avoids a correlated
+  performance dip across every replica during volume modification. (PDBs are deliberately
+  *not* consulted: nothing here evicts or disrupts a pod, so disruption budgets never
+  change in response to volume modification — batching is the semantically honest tool.)
+  Note the fail-closed contract: controllers older than this field reject annotations
+  carrying it, so upgrade the controller before emitting `batchSize`.
 - `claims` (map, required): keys are `volumeClaimTemplate` names. The controller resolves
   actual PVCs as `<claim>-<sts-name>-<ordinal>` for ordinals `0..replicas-1`, cross-checked
   against ownership/labels.

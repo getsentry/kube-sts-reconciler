@@ -1098,6 +1098,287 @@ func TestFailedLatchSurvivesStatusWriteFailure(t *testing.T) {
 	}
 }
 
+func TestWaveRolloutPatchesInBatches(t *testing.T) {
+	// Four PVCs, batchSize 2: the controller must patch ordinals 0-1, wait
+	// for them to converge, then patch 2-3, then proceed to the delete.
+	spec := `{"version":1,"batchSize":2,"claims":{"sqlite":{"storage":"200Gi"}}}`
+	f := newFixture(t,
+		healthySTS(map[string]string{contract.DesiredSpecAnnotation: spec}),
+		boundPVC("sqlite-broker-0", "fast", "100Gi", "100Gi"),
+		boundPVC("sqlite-broker-1", "fast", "100Gi", "100Gi"),
+		boundPVC("sqlite-broker-2", "fast", "100Gi", "100Gi"),
+		boundPVC("sqlite-broker-3", "fast", "100Gi", "100Gi"),
+		expandableSC("fast"),
+	)
+
+	spec200 := func(name string) bool {
+		got := f.getPVC(name).Spec.Resources.Requests[corev1.ResourceStorage]
+		return got.String() == "200Gi"
+	}
+
+	// Wave 1: ordinals 0 and 1 only.
+	f.reconcile()
+	for _, name := range []string{"sqlite-broker-0", "sqlite-broker-1"} {
+		if !spec200(name) {
+			t.Fatalf("%s should be in wave 1", name)
+		}
+	}
+	for _, name := range []string{"sqlite-broker-2", "sqlite-broker-3"} {
+		if spec200(name) {
+			t.Fatalf("%s must not be patched before wave 1 converges", name)
+		}
+	}
+	if st := f.status(); st == nil || st.Reason == "" {
+		t.Fatalf("status should record queued PVCs, got %+v", st)
+	}
+
+	// Backpressure: reconciling again while wave 1 converges patches nothing.
+	f.reconcile()
+	if spec200("sqlite-broker-2") {
+		t.Fatal("wave 2 started before wave 1 converged")
+	}
+	if st := f.status(); st == nil || st.State != contract.StateAwaitingConvergence {
+		t.Fatalf("status = %+v, want AwaitingConvergence", st)
+	}
+
+	// Wave 1 converges -> wave 2 is patched.
+	f.simulateCSI("sqlite-broker-0")
+	f.simulateCSI("sqlite-broker-1")
+	f.reconcile()
+	for _, name := range []string{"sqlite-broker-2", "sqlite-broker-3"} {
+		if !spec200(name) {
+			t.Fatalf("%s should be in wave 2", name)
+		}
+	}
+
+	// Wave 2 converges -> orphan-delete proceeds.
+	f.simulateCSI("sqlite-broker-2")
+	f.simulateCSI("sqlite-broker-3")
+	f.reconcile() // AwaitingConvergence -> converged assessment
+	f.reconcile() // delete
+	if !f.stsGone() {
+		t.Fatal("expected orphan-delete after all waves converged")
+	}
+}
+
+func TestWaveGroupsAllClaimsOfAnOrdinal(t *testing.T) {
+	// batchSize counts replicas, not PVCs: with two volumeClaimTemplates and
+	// batchSize 1, both of ordinal 0's PVCs move in the first wave.
+	spec := `{"version":1,"batchSize":1,"claims":{"sqlite":{"storage":"200Gi"},"logs":{"storage":"20Gi"}}}`
+	sts := healthySTS(map[string]string{contract.DesiredSpecAnnotation: spec})
+	sts.Spec.VolumeClaimTemplates = append(sts.Spec.VolumeClaimTemplates, corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{Name: "logs"},
+		Spec: corev1.PersistentVolumeClaimSpec{
+			AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+			Resources: corev1.VolumeResourceRequirements{
+				Requests: corev1.ResourceList{corev1.ResourceStorage: resource.MustParse("10Gi")},
+			},
+		},
+	})
+	f := newFixture(t, sts,
+		boundPVC("sqlite-broker-0", "fast", "100Gi", "100Gi"),
+		boundPVC("logs-broker-0", "fast", "10Gi", "10Gi"),
+		boundPVC("sqlite-broker-1", "fast", "100Gi", "100Gi"),
+		boundPVC("logs-broker-1", "fast", "10Gi", "10Gi"),
+		expandableSC("fast"),
+	)
+
+	f.reconcile()
+	if got := f.getPVC("sqlite-broker-0").Spec.Resources.Requests[corev1.ResourceStorage]; got.String() != "200Gi" {
+		t.Fatal("sqlite-broker-0 should be patched in wave 1")
+	}
+	if got := f.getPVC("logs-broker-0").Spec.Resources.Requests[corev1.ResourceStorage]; got.String() != "20Gi" {
+		t.Fatal("logs-broker-0 belongs to the same replica and must move in the same wave")
+	}
+	for _, name := range []string{"sqlite-broker-1", "logs-broker-1"} {
+		pvc := f.getPVC(name)
+		req := pvc.Spec.Resources.Requests[corev1.ResourceStorage]
+		if req.String() != "100Gi" && req.String() != "10Gi" {
+			t.Fatalf("%s must wait for wave 2, got %s", name, req.String())
+		}
+	}
+}
+
+func TestPartialWaveCompletesBeforeNextWave(t *testing.T) {
+	// Models a crash mid-wave: the status annotation records wave {0,1}
+	// (written before any patch), ordinal 0 was patched and is converging,
+	// ordinal 1 never got its patch. The recorded wave must complete itself
+	// — patch ordinal 1 — without starting ordinals 2-3.
+	spec := `{"version":1,"batchSize":2,"claims":{"sqlite":{"storage":"200Gi"}}}`
+	recorded := &contract.Status{
+		Version:          contract.SupportedVersion,
+		State:            contract.StatePatching,
+		ObservedSpecHash: contract.HashValue(spec),
+		WaveOrdinals:     []int{0, 1},
+		LastTransition:   time.Now().UTC(),
+	}
+	encoded, err := recorded.Encode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	inflight := boundPVC("sqlite-broker-0", "fast", "200Gi", "100Gi") // spec patched, status lagging
+	f := newFixture(t,
+		healthySTS(map[string]string{
+			contract.DesiredSpecAnnotation: spec,
+			contract.StatusAnnotation:      encoded,
+		}),
+		inflight,
+		boundPVC("sqlite-broker-1", "fast", "100Gi", "100Gi"),
+		boundPVC("sqlite-broker-2", "fast", "100Gi", "100Gi"),
+		boundPVC("sqlite-broker-3", "fast", "100Gi", "100Gi"),
+		expandableSC("fast"),
+	)
+
+	f.reconcile()
+	if got := f.getPVC("sqlite-broker-1").Spec.Resources.Requests[corev1.ResourceStorage]; got.String() != "200Gi" {
+		t.Fatal("ordinal 1 belongs to the recorded wave and must be patched now")
+	}
+	for _, name := range []string{"sqlite-broker-2", "sqlite-broker-3"} {
+		if got := f.getPVC(name).Spec.Resources.Requests[corev1.ResourceStorage]; got.String() != "100Gi" {
+			t.Fatalf("%s belongs to the next wave and must wait", name)
+		}
+	}
+}
+
+func TestGateBlockPreservesWaveRecord(t *testing.T) {
+	// The health gate closes mid-wave (partial wave: ordinal 0 converging,
+	// ordinal 1 unpatched). The Blocked status must carry the wave record,
+	// so the wave resumes — patching ordinal 1, not opening a new wave —
+	// once the gate clears.
+	spec := `{"version":1,"batchSize":2,"claims":{"sqlite":{"storage":"200Gi"}}}`
+	recorded := &contract.Status{
+		Version:          contract.SupportedVersion,
+		State:            contract.StatePatching,
+		ObservedSpecHash: contract.HashValue(spec),
+		WaveOrdinals:     []int{0, 1},
+		LastTransition:   time.Now().UTC(),
+	}
+	encoded, err := recorded.Encode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	sts := healthySTS(map[string]string{
+		contract.DesiredSpecAnnotation: spec,
+		contract.StatusAnnotation:      encoded,
+	})
+	sts.Status.ReadyReplicas = 0 // gate closed
+	f := newFixture(t, sts,
+		boundPVC("sqlite-broker-0", "fast", "200Gi", "100Gi"), // wave member, converging
+		boundPVC("sqlite-broker-1", "fast", "100Gi", "100Gi"), // wave member, unpatched
+		boundPVC("sqlite-broker-2", "fast", "100Gi", "100Gi"),
+		boundPVC("sqlite-broker-3", "fast", "100Gi", "100Gi"),
+		expandableSC("fast"),
+	)
+
+	f.reconcile() // blocked
+	st := f.status()
+	if st == nil || st.State != contract.StateBlocked {
+		t.Fatalf("status = %+v, want Blocked", st)
+	}
+	if len(st.WaveOrdinals) != 2 {
+		t.Fatalf("Blocked status must preserve the wave record, got %+v", st.WaveOrdinals)
+	}
+
+	// Gate clears: the recorded wave resumes.
+	cur := f.getSTS()
+	cur.Status.ReadyReplicas = 2
+	if err := f.client.Status().Update(context.Background(), cur); err != nil {
+		t.Fatal(err)
+	}
+	f.reconcile()
+	if got := f.getPVC("sqlite-broker-1").Spec.Resources.Requests[corev1.ResourceStorage]; got.String() != "200Gi" {
+		t.Fatal("recorded wave must resume after the gate clears")
+	}
+	for _, name := range []string{"sqlite-broker-2", "sqlite-broker-3"} {
+		if got := f.getPVC(name).Spec.Resources.Requests[corev1.ResourceStorage]; got.String() != "100Gi" {
+			t.Fatalf("%s must still wait for the next wave", name)
+		}
+	}
+}
+
+func TestNextWaveWaitsForWholeWave(t *testing.T) {
+	// Bugbot scenario: wave {0,1} in flight, ordinal 0 converges first. The
+	// next wave must NOT slide in while ordinal 1 is still converging.
+	spec := `{"version":1,"batchSize":2,"claims":{"sqlite":{"storage":"200Gi"}}}`
+	f := newFixture(t,
+		healthySTS(map[string]string{contract.DesiredSpecAnnotation: spec}),
+		boundPVC("sqlite-broker-0", "fast", "100Gi", "100Gi"),
+		boundPVC("sqlite-broker-1", "fast", "100Gi", "100Gi"),
+		boundPVC("sqlite-broker-2", "fast", "100Gi", "100Gi"),
+		boundPVC("sqlite-broker-3", "fast", "100Gi", "100Gi"),
+		expandableSC("fast"),
+	)
+
+	f.reconcile() // wave {0,1} patched and recorded
+	f.simulateCSI("sqlite-broker-0")
+	f.reconcile() // ordinal 1 still converging: no new patches
+	for _, name := range []string{"sqlite-broker-2", "sqlite-broker-3"} {
+		if got := f.getPVC(name).Spec.Resources.Requests[corev1.ResourceStorage]; got.String() != "100Gi" {
+			t.Fatalf("%s must wait until the WHOLE wave has converged", name)
+		}
+	}
+	if st := f.status(); st == nil || len(st.WaveOrdinals) != 2 {
+		t.Fatalf("recorded wave must be carried through convergence, got %+v", st)
+	}
+
+	f.simulateCSI("sqlite-broker-1")
+	f.reconcile() // wave done -> wave {2,3}
+	for _, name := range []string{"sqlite-broker-2", "sqlite-broker-3"} {
+		if got := f.getPVC(name).Spec.Resources.Requests[corev1.ResourceStorage]; got.String() != "200Gi" {
+			t.Fatalf("%s should be patched once the previous wave fully converged", name)
+		}
+	}
+}
+
+func TestNoBatchSizeMeansAllAtOnce(t *testing.T) {
+	// Without batchSize the whole set is one wave: a PVC already converging
+	// does not delay patching the rest.
+	desired := desiredJSON(t, map[string]map[string]string{"sqlite": {"storage": "200Gi"}})
+	inflight := boundPVC("sqlite-broker-0", "fast", "200Gi", "100Gi")
+	f := newFixture(t,
+		healthySTS(map[string]string{contract.DesiredSpecAnnotation: desired}),
+		inflight,
+		boundPVC("sqlite-broker-1", "fast", "100Gi", "100Gi"),
+		expandableSC("fast"),
+	)
+
+	f.reconcile()
+	if got := f.getPVC("sqlite-broker-1").Spec.Resources.Requests[corev1.ResourceStorage]; got.String() != "200Gi" {
+		t.Fatal("absent batchSize means all at once; converging PVCs must not delay the rest")
+	}
+}
+
+func TestConvergenceTimeoutIsPerWave(t *testing.T) {
+	// Two waves that each converge within the timeout must succeed even when
+	// their combined duration exceeds it: the clock resets per wave.
+	spec := `{"version":1,"batchSize":1,"claims":{"sqlite":{"storage":"200Gi"}}}`
+	f := newFixture(t,
+		healthySTS(map[string]string{contract.DesiredSpecAnnotation: spec}),
+		boundPVC("sqlite-broker-0", "fast", "100Gi", "100Gi"),
+		boundPVC("sqlite-broker-1", "fast", "100Gi", "100Gi"),
+		expandableSC("fast"),
+	)
+	f.r.ConvergenceTimeout = 80 * time.Millisecond
+
+	f.reconcile()                     // patch wave 1 (ordinal 0)
+	f.reconcile()                     // AwaitingConvergence, anchor T0
+	time.Sleep(50 * time.Millisecond) // wave 1 takes 50ms — under the timeout
+	f.simulateCSI("sqlite-broker-0")
+	f.reconcile()                     // wave 1 done; patch wave 2 (ordinal 1), anchor cleared
+	f.reconcile()                     // AwaitingConvergence with a FRESH anchor
+	time.Sleep(50 * time.Millisecond) // wave 2 takes 50ms; cumulative 100ms > 80ms
+	f.reconcile()
+	if st := f.status(); st == nil || st.State == contract.StateFailed {
+		t.Fatalf("per-wave clock must not fail on cumulative time: %+v", st)
+	}
+	f.simulateCSI("sqlite-broker-1")
+	f.reconcile() // converged
+	f.reconcile() // delete
+	if !f.stsGone() {
+		t.Fatal("rollout should complete")
+	}
+}
+
 func TestMapPVCToStatefulSet(t *testing.T) {
 	desired := desiredJSON(t, map[string]map[string]string{"sqlite": {"storage": "200Gi"}})
 	f := newFixture(t, healthySTS(map[string]string{contract.DesiredSpecAnnotation: desired}))
